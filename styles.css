@@ -218,6 +218,7 @@ html, body {
   flex: 1; overflow: hidden; position: relative;
   background: #050810;
   touch-action: none;
+  min-height: 200px; /* ensures clientHeight > 0 even before flex resolves */
 }
 #game-canvas {
   display: block;
@@ -352,4 +353,4 @@ html, body {
 .hidden { display: none !important; }
 .text-warn { color: var(--warn); }
 .text-danger { color: var(--danger); }
-.text-good { color: var(--green); }4
+.text-good { color: var(--green); }
