@@ -1,78 +1,59 @@
 /**
  * MORALE SYSTEM
  * -------------
- * Tracks tribe morale (0–100). Morale acts as a multiplier on growth rate
- * and decay rate for needs. High morale = faster growth, slower decay.
- * Low morale = slower growth, faster decay, eventually causes unrest deaths.
- *
- * Morale is affected by:
- *   - Disasters    → big drop
- *   - Deaths       → moderate drop
- *   - Growth       → small boost
- *   - Festivals    → large boost (player-triggered, costs food)
- *   - Era advances → boost
- *   - Merchants    → small boost
- *
- * To extend: add morale-triggered "unrest" events at very low morale.
+ * Morale now has visible gameplay impact:
+ * - gather efficiency
+ * - survival resilience
+ * - comeback potential
  */
-
 const MoraleSystem = (() => {
-
-  const DEFAULT_MORALE  = 65;
-  const FESTIVAL_COST   = { food: 20 };  // cost to hold a festival
-  const FESTIVAL_BOOST  = 25;
-  const FESTIVAL_COOLDOWN = 10;          // turns between festivals
+  const DEFAULT_MORALE = 65;
+  const FESTIVAL_COST = { food: 20 };
+  const FESTIVAL_BOOST = 25;
+  const FESTIVAL_COOLDOWN = 10;
 
   function create() {
     return {
-      morale:           DEFAULT_MORALE,
+      morale: DEFAULT_MORALE,
       festivalCooldown: 0,
-      lastEvent:        '',   // text for UI
+      lastEvent: '',
+      lastEffects: '',
     };
   }
 
   function fromSave(data) {
     return {
-      morale:           data.morale           ?? DEFAULT_MORALE,
-      festivalCooldown: data.festivalCooldown ?? 0,
-      lastEvent:        data.lastEvent        ?? '',
+      morale: data?.morale ?? DEFAULT_MORALE,
+      festivalCooldown: data?.festivalCooldown ?? 0,
+      lastEvent: data?.lastEvent ?? '',
+      lastEffects: data?.lastEffects ?? '',
     };
   }
 
-  /**
-   * Apply morale changes at end of turn.
-   * @param {object} moraleState  - mutated in place
-   * @param {object} tribeResult  - { deaths, grew } from TribeSystem
-   * @param {boolean} disasterHit - true if a disaster fired this turn
-   * @param {number}  era         - current era index
-   * @param {number}  prevEra     - era at start of turn
-   */
-  function processTurn(moraleState, tribeResult, disasterHit, era, prevEra) {
+  function processTurn(moraleState, tribeResult, disasterHit, era, prevEra, buildingsProxy = null) {
     let delta = 0;
-
-    // Natural slow drift toward 50 (regression to mean)
     delta += (50 - moraleState.morale) * 0.04;
-
-    if (disasterHit)           delta -= 15;
+    if (disasterHit) delta -= 15;
     if (tribeResult.deaths > 0) delta -= Math.min(12, tribeResult.deaths * 2);
-    if (tribeResult.grew   > 0) delta += Math.min(5,  tribeResult.grew);
-    if (era > prevEra)          delta += 20;
+    if (tribeResult.grew > 0) delta += Math.min(5, tribeResult.grew);
+    if (era > prevEra) delta += 20;
+    delta += Math.min(6, buildingsProxy?.getMoralePerTurn?.() || 0);
 
     moraleState.morale = Math.round(Math.max(0, Math.min(100, moraleState.morale + delta)));
-
     if (moraleState.festivalCooldown > 0) moraleState.festivalCooldown--;
+
+    const gatherPct = Math.round((getGatherMultiplier(moraleState) - 1) * 100);
+    const deathPct = Math.round((1 - getDeathMultiplier(moraleState)) * 100);
+    moraleState.lastEffects = `${gatherPct >= 0 ? '+' : ''}${gatherPct}% gather · ${deathPct >= 0 ? '-' : '+'}${Math.abs(deathPct)}% death pressure`;
   }
 
-  /**
-   * Hold a festival. Returns { ok, reason }.
-   * Costs food, boosts morale, has a cooldown.
-   */
   function holdFestival(moraleState, resources) {
-    if (moraleState.festivalCooldown > 0)
+    if (moraleState.festivalCooldown > 0) {
       return { ok: false, reason: `Festival cooldown: ${moraleState.festivalCooldown} turns` };
-    if (!ResourceSystem.canAfford(resources, FESTIVAL_COST))
+    }
+    if (!ResourceSystem.canAfford(resources, FESTIVAL_COST)) {
       return { ok: false, reason: `Need ${FESTIVAL_COST.food} food to hold a festival` };
-
+    }
     ResourceSystem.spend(resources, FESTIVAL_COST);
     moraleState.morale = Math.min(100, moraleState.morale + FESTIVAL_BOOST);
     moraleState.festivalCooldown = FESTIVAL_COOLDOWN;
@@ -80,20 +61,24 @@ const MoraleSystem = (() => {
     return { ok: true };
   }
 
-  /**
-   * Morale multiplier for growth rate.
-   * 1.5× at 100 morale, 0.5× at 0 morale.
-   */
   function growthMultiplier(moraleState) {
-    return 0.5 + (moraleState.morale / 100);
+    return 0.55 + (moraleState.morale / 100) * 1.05;
   }
 
-  /**
-   * Morale multiplier for need decay (inverted — high morale = less decay).
-   * 0.7× at 100 morale, 1.3× at 0 morale.
-   */
   function decayMultiplier(moraleState) {
-    return 1.3 - (moraleState.morale / 100) * 0.6;
+    return 1.32 - (moraleState.morale / 100) * 0.62;
+  }
+
+  function getGatherMultiplier(moraleState) {
+    return 0.75 + (moraleState.morale / 100) * 0.6;
+  }
+
+  function getDeathMultiplier(moraleState) {
+    return 1.15 - (moraleState.morale / 100) * 0.45;
+  }
+
+  function getMiracleChance(moraleState, miracleBoost = 0) {
+    return Math.max(0.03, Math.min(0.45, 0.06 + moraleState.morale / 500 + miracleBoost));
   }
 
   function getLabel(morale) {
@@ -105,9 +90,15 @@ const MoraleSystem = (() => {
   }
 
   return {
-    create, fromSave, processTurn, holdFestival,
-    growthMultiplier, decayMultiplier, getLabel,
-    FESTIVAL_COST,
+    create,
+    fromSave,
+    processTurn,
+    holdFestival,
+    growthMultiplier,
+    decayMultiplier,
+    getGatherMultiplier,
+    getDeathMultiplier,
+    getMiracleChance,
+    getLabel,
   };
-
 })();
