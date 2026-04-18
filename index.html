@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="theme-color" content="#0d1117" />
+  <title>Peak Survivors</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+ 
+  <!-- =============================================
+       SCREENS
+       ============================================= -->
+ 
+  <!-- Main Menu -->
+  <div id="screen-menu" class="screen active">
+    <div class="menu-bg"></div>
+    <div class="menu-content">
+      <div class="game-logo">
+        <span class="logo-peak">⛰️</span>
+        <h1>PEAK<br>SURVIVORS</h1>
+        <p class="logo-sub">Survive the mountain. Hold the summit.</p>
+      </div>
+      <div class="menu-buttons">
+        <button class="btn btn-primary" id="btn-new-game">NEW EXPEDITION</button>
+        <button class="btn btn-secondary" id="btn-continue" disabled>CONTINUE</button>
+        <button class="btn btn-ghost" id="btn-how-to-play">HOW TO PLAY</button>
+      </div>
+      <div class="menu-seed">
+        <label for="seed-input">Mountain Seed (leave blank for random)</label>
+        <input type="text" id="seed-input" placeholder="e.g. 42069" maxlength="20" />
+      </div>
+    </div>
+  </div>
+ 
+  <!-- How To Play -->
+  <div id="screen-howto" class="screen">
+    <div class="howto-content">
+      <h2>HOW TO PLAY</h2>
+      <div class="howto-sections">
+        <div class="howto-block">
+          <h3>🗺️ The Mountain</h3>
+          <p>You lead a tribe stranded atop a procedurally generated mountain. The world is hostile — storms, floods, and freezing cold will test you every season.</p>
+        </div>
+        <div class="howto-block">
+          <h3>👥 Your Tribe</h3>
+          <p>Your people need <strong>Food</strong>, <strong>Shelter</strong>, and <strong>Warmth</strong>. Neglect any for too long and they die. Keep all three up and they multiply.</p>
+        </div>
+        <div class="howto-block">
+          <h3>⛏️ Resources</h3>
+          <p>Tap tiles to gather <strong>Wood</strong> (🌲), <strong>Stone</strong> (🪨), and <strong>Food</strong> (🌿). Resources are finite — plan carefully.</p>
+        </div>
+        <div class="howto-block">
+          <h3>🏗️ Buildings</h3>
+          <p>Use the BUILD menu to place structures. <strong>Shelters</strong> protect your people. <strong>Storage</strong> expands capacity. <strong>Watchtowers</strong> give disaster warnings.</p>
+        </div>
+        <div class="howto-block">
+          <h3>⛈️ Disasters</h3>
+          <p>Storms, floods, and blizzards will strike. A <strong>Watchtower</strong> warns you 1 turn early. Survivors who have shelter take less damage.</p>
+        </div>
+        <div class="howto-block">
+          <h3>📅 Time</h3>
+          <p>Each tap of <strong>END TURN</strong> advances one day. Seasons change every 30 days — winter is deadly. There is no win, only survival.</p>
+        </div>
+      </div>
+      <button class="btn btn-primary" id="btn-howto-back">← BACK</button>
+    </div>
+  </div>
+ 
+  <!-- Game Over -->
+  <div id="screen-gameover" class="screen">
+    <div class="gameover-content">
+      <h2>YOUR TRIBE HAS FALLEN</h2>
+      <div id="gameover-stats"></div>
+      <div class="gameover-buttons">
+        <button class="btn btn-primary" id="btn-new-after-death">NEW EXPEDITION</button>
+        <button class="btn btn-ghost" id="btn-menu-after-death">MAIN MENU</button>
+      </div>
+    </div>
+  </div>
+ 
+  <!-- =============================================
+       GAME SCREEN
+       ============================================= -->
+  <div id="screen-game" class="screen">
+ 
+    <!-- TOP HUD -->
+    <div id="hud-top">
+      <div class="hud-stat" id="hud-pop">
+        <span class="hud-icon">👥</span>
+        <span class="hud-val" id="stat-pop">0</span>
+      </div>
+      <div class="hud-stat" id="hud-food">
+        <span class="hud-icon">🌿</span>
+        <span class="hud-val" id="stat-food">0</span>
+      </div>
+      <div class="hud-stat" id="hud-wood">
+        <span class="hud-icon">🌲</span>
+        <span class="hud-val" id="stat-wood">0</span>
+      </div>
+      <div class="hud-stat" id="hud-stone">
+        <span class="hud-icon">🪨</span>
+        <span class="hud-val" id="stat-stone">0</span>
+      </div>
+      <div class="hud-stat" id="hud-day">
+        <span class="hud-icon">📅</span>
+        <span class="hud-val" id="stat-day">1</span>
+      </div>
+    </div>
+ 
+    <!-- SEASON / ERA BAR -->
+    <div id="hud-season">
+      <span id="season-label">🌱 Spring · Year 1</span>
+      <span id="era-label">Stone Age</span>
+    </div>
+ 
+    <!-- EVENT NOTIFICATION -->
+    <div id="event-banner" class="hidden">
+      <span id="event-icon">⚠️</span>
+      <span id="event-text">Event incoming</span>
+    </div>
+ 
+    <!-- MAP CANVAS -->
+    <div id="map-viewport">
+      <canvas id="game-canvas"></canvas>
+    </div>
+ 
+    <!-- BOTTOM PANEL: MODE TABS -->
+    <div id="bottom-panel">
+      <div id="mode-tabs">
+        <button class="mode-tab active" data-mode="gather">⛏️ GATHER</button>
+        <button class="mode-tab" data-mode="build">🏗️ BUILD</button>
+        <button class="mode-tab" data-mode="info">📋 INFO</button>
+      </div>
+ 
+      <!-- Gather Mode Panel -->
+      <div id="panel-gather" class="mode-panel active">
+        <p class="panel-hint">Tap a tile to gather its resources.</p>
+        <div id="gather-log"></div>
+      </div>
+ 
+      <!-- Build Mode Panel -->
+      <div id="panel-build" class="mode-panel">
+        <div id="build-options"></div>
+      </div>
+ 
+      <!-- Info Panel -->
+      <div id="panel-info" class="mode-panel">
+        <div id="info-content"></div>
+      </div>
+    </div>
+ 
+    <!-- BOTTOM ACTION BAR -->
+    <div id="action-bar">
+      <button class="btn btn-danger" id="btn-menu">☰</button>
+      <button class="btn btn-primary btn-end-turn" id="btn-end-turn">END TURN ▶</button>
+      <button class="btn btn-secondary" id="btn-autosave-indicator">💾</button>
+    </div>
+ 
+    <!-- PAUSE MENU OVERLAY -->
+    <div id="pause-menu" class="hidden">
+      <div class="pause-box">
+        <h3>PAUSED</h3>
+        <button class="btn btn-primary" id="btn-resume">RESUME</button>
+        <button class="btn btn-secondary" id="btn-save-manual">SAVE GAME</button>
+        <button class="btn btn-danger" id="btn-abandon">ABANDON RUN</button>
+      </div>
+    </div>
+ 
+  </div><!-- end #screen-game -->
+ 
+  <!-- Load order: utils → systems → main -->
+  <script src="game/save.js"></script>
+  <script src="game/world.js"></script>
+  <script src="game/tribe.js"></script>
+  <script src="game/resources.js"></script>
+  <script src="game/buildings.js"></script>
+  <script src="game/events.js"></script>
+  <script src="game/ui.js"></script>
+  <script src="main.js"></script>
+</body>
+</html>
+ 
