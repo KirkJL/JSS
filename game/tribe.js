@@ -17,12 +17,16 @@ const TribeSystem = (() => {
 
   // ---- Constants ----
   // Turns before starvation / freezing / exposure kills members
-  const STARVE_THRESHOLD  = 3;   // turns without food before deaths start
-  const FREEZE_THRESHOLD  = 2;   // turns without warmth
-  const UNSHELTER_THRESHOLD = 4; // turns without shelter
-  const DEATH_RATE        = .20; // fraction of population that dies per over-threshold turn
-  const GROWTH_RATE       = .06; // fraction that grows per turn when ALL needs met
-  const STARTING_POP      = 8;
+  const STARVE_THRESHOLD    = 3;   // turns without food before deaths start
+  const FREEZE_THRESHOLD    = 2;   // turns without warmth
+  const UNSHELTER_THRESHOLD = 4;   // turns without shelter
+  const DEATH_RATE          = .20; // fraction of population that dies per over-threshold turn
+  const GROWTH_RATE         = .08; // fraction that grows per turn when needs met
+  const STARTING_POP        = 8;
+
+  // Fractional growth accumulator — fixes the floor-to-zero bug on small populations.
+  // e.g. 8 people * 0.08 = 0.64 per turn → accumulates until it crosses 1.
+  let growthAccumulator = 0;
 
   // Need decay per turn (how much each need drops per END TURN)
   // Modified by season and events
@@ -60,13 +64,16 @@ const TribeSystem = (() => {
    * @param {boolean} disasterActive - true if a freeze/storm disaster is happening
    * @returns {object} { died, grew, messages }  – summary for UI
    */
-  function processTurn(tribe, resources, buildings, season, disasterActive) {
+  function processTurn(tribe, resources, buildings, season, disasterActive, moraleMultipliers) {
+    // moraleMultipliers: { growth, decay } from MoraleSystem
+    const mGrowth = moraleMultipliers?.growth ?? 1.0;
+    const mDecay  = moraleMultipliers?.decay  ?? 1.0;
     const msgs = [];
     tribe.deathsThisTurn = 0;
     tribe.growthThisTurn = 0;
 
     // ---- 1. Decay needs ----
-    const winterMult = season === 3 ? 1.6 : 1.0;
+    const winterMult = (season === 3 ? 1.6 : 1.0) * mDecay;
 
     // Food: consume from stockpile proportional to pop
     const foodConsumed = Math.ceil(tribe.population * .5); // half a food per person
@@ -129,14 +136,21 @@ const TribeSystem = (() => {
     tribe.population    -= deaths;
     tribe.deathsThisTurn = deaths;
 
-    // ---- 4. Growth (if ALL needs are healthy) ----
-    if (tribe.foodNeed >= 50 && tribe.shelterNeed >= 50 && tribe.warmthNeed >= 50) {
-      const growth = Math.floor(tribe.population * GROWTH_RATE);
-      if (growth > 0) {
+    // ---- 4. Growth (if needs are reasonably healthy) ----
+    // Uses a fractional accumulator so small tribes (pop < 12) still grow.
+    // Each need only needs to be >= 40 to allow growth (easier to achieve).
+    if (tribe.foodNeed >= 40 && tribe.shelterNeed >= 40 && tribe.warmthNeed >= 40) {
+      growthAccumulator += tribe.population * GROWTH_RATE * mGrowth;
+      const growth = Math.floor(growthAccumulator);
+      if (growth >= 1) {
+        growthAccumulator   -= growth;
         tribe.population    += growth;
         tribe.growthThisTurn = growth;
-        if (growth > 0) msgs.push({ text: `+${growth} joined the tribe 🌱`, type: 'good' });
+        msgs.push({ text: `+${growth} joined the tribe 🌱`, type: 'good' });
       }
+    } else {
+      // Decay accumulator when needs aren't met
+      growthAccumulator = Math.max(0, growthAccumulator - 0.1);
     }
 
     // ---- 5. Check game over ----
@@ -148,6 +162,7 @@ const TribeSystem = (() => {
 
   /** Restore tribe from saved data. */
   function fromSave(data) {
+    growthAccumulator = data.growthAccumulator || 0;
     return {
       population:      data.population,
       foodNeed:        data.foodNeed,
@@ -161,6 +176,9 @@ const TribeSystem = (() => {
     };
   }
 
-  return { create, processTurn, fromSave, NEED_DECAY };
+  /** Expose accumulator for saving. */
+  function getAccumulator() { return growthAccumulator; }
+
+  return { create, processTurn, fromSave, getAccumulator, NEED_DECAY };
 
 })();
