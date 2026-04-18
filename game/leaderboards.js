@@ -10,7 +10,7 @@
 const LeaderboardSystem = (() => {
 
   // ⚠️  CHANGE THIS to your deployed Worker URL after `wrangler deploy`
-  const WORKER_URL = 'https://peak-survivors-leaderboard.YOUR-SUBDOMAIN.workers.dev';
+  const WORKER_URL = 'jss-worker.kirkjlemon.workers.dev';
 
   let lastScores   = [];
   let submitPending = false;
