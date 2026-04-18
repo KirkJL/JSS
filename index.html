@@ -10,11 +10,11 @@
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
- 
+
   <!-- =============================================
        SCREENS
        ============================================= -->
- 
+
   <!-- Main Menu -->
   <div id="screen-menu" class="screen active">
     <div class="menu-bg"></div>
@@ -35,7 +35,7 @@
       </div>
     </div>
   </div>
- 
+
   <!-- How To Play -->
   <div id="screen-howto" class="screen">
     <div class="howto-content">
@@ -69,24 +69,32 @@
       <button class="btn btn-primary" id="btn-howto-back">← BACK</button>
     </div>
   </div>
- 
+
   <!-- Game Over -->
   <div id="screen-gameover" class="screen">
     <div class="gameover-content">
       <h2>YOUR TRIBE HAS FALLEN</h2>
       <div id="gameover-stats"></div>
+      <div id="leaderboard-section">
+        <h3>🏆 LEADERBOARD</h3>
+        <input type="text" id="leaderboard-name-input" placeholder="Enter your name" maxlength="20" />
+        <button class="btn btn-primary" id="btn-submit-score">SUBMIT SCORE</button>
+        <div id="leaderboard-list"></div>
+        <div id="leaderboard-status"></div>
+      </div>
+
       <div class="gameover-buttons">
         <button class="btn btn-primary" id="btn-new-after-death">NEW EXPEDITION</button>
         <button class="btn btn-ghost" id="btn-menu-after-death">MAIN MENU</button>
       </div>
     </div>
   </div>
- 
+
   <!-- =============================================
        GAME SCREEN
        ============================================= -->
   <div id="screen-game" class="screen">
- 
+
     <!-- TOP HUD -->
     <div id="hud-top">
       <div class="hud-stat" id="hud-pop">
@@ -105,61 +113,88 @@
         <span class="hud-icon">🪨</span>
         <span class="hud-val" id="stat-stone">0</span>
       </div>
+      <div class="hud-stat" id="hud-morale">
+        <span class="hud-icon">💛</span>
+        <div class="morale-bar-track"><div class="morale-bar-fill" id="morale-bar-fill" style="width:65%;background:#f39c12"></div></div>
+      </div>
       <div class="hud-stat" id="hud-day">
         <span class="hud-icon">📅</span>
         <span class="hud-val" id="stat-day">1</span>
       </div>
     </div>
- 
+
     <!-- SEASON / ERA BAR -->
     <div id="hud-season">
       <span id="season-label">🌱 Spring · Year 1</span>
       <span id="era-label">Stone Age</span>
     </div>
- 
+
     <!-- EVENT NOTIFICATION -->
     <div id="event-banner" class="hidden">
       <span id="event-icon">⚠️</span>
       <span id="event-text">Event incoming</span>
     </div>
- 
+
     <!-- MAP CANVAS -->
     <div id="map-viewport">
       <canvas id="game-canvas"></canvas>
     </div>
- 
+
+    <!-- MERCHANT BANNER -->
+    <div id="merchant-banner" class="hidden">
+      <span>🐪</span>
+      <span id="merchant-text">A merchant has arrived!</span>
+    </div>
+
+    <!-- PARTICLE CANVAS -->
+    <canvas id="particle-canvas"></canvas>
+
     <!-- BOTTOM PANEL: MODE TABS -->
     <div id="bottom-panel">
       <div id="mode-tabs">
         <button class="mode-tab active" data-mode="gather">⛏️ GATHER</button>
         <button class="mode-tab" data-mode="build">🏗️ BUILD</button>
         <button class="mode-tab" data-mode="info">📋 INFO</button>
+        <button class="mode-tab" data-mode="trade">🐪 TRADE</button>
+        <button class="mode-tab" data-mode="achievements">🏆</button>
       </div>
- 
+
       <!-- Gather Mode Panel -->
       <div id="panel-gather" class="mode-panel active">
         <p class="panel-hint">Tap a tile to gather its resources.</p>
         <div id="gather-log"></div>
       </div>
- 
+
       <!-- Build Mode Panel -->
       <div id="panel-build" class="mode-panel">
         <div id="build-options"></div>
       </div>
- 
+
       <!-- Info Panel -->
       <div id="panel-info" class="mode-panel">
         <div id="info-content"></div>
       </div>
+
+      <!-- Trade Panel -->
+      <div id="panel-trade" class="mode-panel">
+        <div id="trade-content"><p class="trade-empty">No merchant present. Check back later.</p></div>
+      </div>
+
+      <!-- Achievements Panel -->
+      <div id="panel-achievements" class="mode-panel">
+        <div id="achievements-content"></div>
+      </div>
     </div>
- 
+
     <!-- BOTTOM ACTION BAR -->
     <div id="action-bar">
       <button class="btn btn-danger" id="btn-menu">☰</button>
+      <button class="btn btn-secondary" id="btn-festival" title="Hold Festival (costs 20 food)">🎉</button>
+      <button class="btn btn-secondary" id="btn-sound" title="Toggle Sound">🔊</button>
       <button class="btn btn-primary btn-end-turn" id="btn-end-turn">END TURN ▶</button>
       <button class="btn btn-secondary" id="btn-autosave-indicator">💾</button>
     </div>
- 
+
     <!-- PAUSE MENU OVERLAY -->
     <div id="pause-menu" class="hidden">
       <div class="pause-box">
@@ -169,11 +204,16 @@
         <button class="btn btn-danger" id="btn-abandon">ABANDON RUN</button>
       </div>
     </div>
- 
+
   </div><!-- end #screen-game -->
- 
+
   <!-- Load order: utils → systems → main -->
   <script src="game/save.js"></script>
+  <script src="game/sound.js"></script>
+  <script src="game/morale.js"></script>
+  <script src="game/merchant.js"></script>
+  <script src="game/achievements.js"></script>
+  <script src="game/leaderboard.js"></script>
   <script src="game/world.js"></script>
   <script src="game/tribe.js"></script>
   <script src="game/resources.js"></script>
@@ -183,4 +223,3 @@
   <script src="main.js"></script>
 </body>
 </html>
- 
