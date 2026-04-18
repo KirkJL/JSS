@@ -1,21 +1,24 @@
 /**
- * MAIN.JS v2 — Game Orchestrator
- * --------------------------------
- * Wires all systems: world, tribe, resources, buildings, events,
- * morale, merchant, achievements, sound, particles, leaderboard.
+ * MAIN.JS — Game Orchestrator
+ * ---------------------------
+ * Additive overhaul:
+ * - villager task assignment
+ * - strategy buildings
+ * - resource pressure
+ * - discovery rewards
+ * - stronger merchant
+ * - morale gameplay impact
+ * - insane run moments
+ * - better end screen / leaderboard payload
+ * - safer save payloads with visible seed
  */
 
-let G    = null;
-let rng  = null;
-let currentMode      = 'gather';
+let G = null;
+let rng = null;
+let currentMode = 'gather';
 let selectedBuildDef = null;
-
-// Particle system state (canvas-based, lives in main for simplicity)
 let particles = [];
-
-// =============================================
-// INIT
-// =============================================
+let particleRAF = null;
 
 window.addEventListener('DOMContentLoaded', () => {
   UISystem.init(document.getElementById('game-canvas'), onTileTap);
@@ -23,21 +26,18 @@ window.addEventListener('DOMContentLoaded', () => {
   initMenu();
   bindGameControls();
 
-  if (SaveSystem.hasSave()) {
-    document.getElementById('btn-continue').disabled = false;
-  }
+  if (SaveSystem.hasSave()) document.getElementById('btn-continue').disabled = false;
 
   window.addEventListener('resize', () => {
-    if (G) { UISystem.recalcLayout(); UISystem.setWorld(G.world, G); UISystem.render(); }
+    if (G) {
+      UISystem.recalcLayout();
+      UISystem.setWorld(G.world, G);
+      UISystem.render();
+    }
   });
 
-  // Particle canvas sizing
   window.addEventListener('resize', resizeParticleCanvas);
 });
-
-// =============================================
-// MENU
-// =============================================
 
 function initMenu() {
   document.getElementById('btn-new-game').addEventListener('click', () => {
@@ -49,10 +49,6 @@ function initMenu() {
   document.getElementById('btn-new-after-death').addEventListener('click', () => UISystem.showScreen('menu'));
   document.getElementById('btn-menu-after-death').addEventListener('click', () => UISystem.showScreen('menu'));
 }
-
-// =============================================
-// GAME SETUP
-// =============================================
 
 function startNewGame(seedStr) {
   const world = WorldGen.generate(seedStr);
@@ -67,11 +63,20 @@ function startNewGame(seedStr) {
 function loadGame() {
   const saved = SaveSystem.load();
   if (!saved) { UISystem.toast('No valid save found.'); return; }
+
   const world = WorldGen.generate(saved.seed);
-  for (const st of saved.worldTiles) {
+  for (const st of saved.worldTiles || []) {
     const tile = WorldGen.getTile(world, st.x, st.y);
-    if (tile) { tile.depleted = st.depleted; tile.type = st.type; tile.buildingId = st.buildingId; }
+    if (!tile) continue;
+    tile.depleted = !!st.depleted;
+    tile.depletedIn = st.depletedIn || 0;
+    tile.type = st.type;
+    tile.buildingId = st.buildingId;
+    tile.originalType = st.originalType || st.type;
+    tile.special = st.special || tile.special || null;
+    tile.specialClaimed = !!st.specialClaimed;
   }
+
   initGameState(world, saved);
   UISystem.showScreen('game');
   resizeParticleCanvas();
@@ -83,39 +88,108 @@ function initGameState(world, saved) {
   const dayOffset = saved ? saved.day : 0;
   rng = makePRNG((world.numericSeed + dayOffset * 7919) >>> 0);
 
+  const tribe = saved ? TribeSystem.fromSave(saved.tribe) : TribeSystem.create();
+  const resources = saved ? ResourceSystem.fromSave(saved.resources) : ResourceSystem.create();
+  const buildings = saved ? BuildingSystem.fromSave(saved.buildings) : BuildingSystem.create();
+  const morale = saved?.morale ? MoraleSystem.fromSave(saved.morale) : MoraleSystem.create();
+  const merchant = saved?.merchant ? MerchantSystem.fromSave(saved.merchant) : MerchantSystem.createState();
+  const achievements = saved?.achievements ? AchievementSystem.fromSave(saved.achievements) : AchievementSystem.createState();
+  const events = saved?.events ? EventSystem.fromSave(saved.events) :
+    EventSystem.fromSave(saved?.eventLog ? { history: saved.eventLog } : EventSystem.createState());
+
+  const startTile = WorldGen.findStartTile(world);
+
   G = {
     world,
-    seed:   world.seed,
-    day:    saved?.day    ?? 1,
-    year:   saved?.year   ?? 1,
+    seed: world.seed,
+    day: saved?.day ?? 1,
+    year: saved?.year ?? 1,
     season: saved?.season ?? 0,
-    era:    saved?.era    ?? 0,
-    prevEra: saved?.era   ?? 0,
-
-    tribe:        saved ? TribeSystem.fromSave(saved.tribe)           : TribeSystem.create(),
-    resources:    saved ? ResourceSystem.fromSave(saved.resources)    : ResourceSystem.create(),
-    buildings:    saved ? BuildingSystem.fromSave(saved.buildings)     : BuildingSystem.create(),
-    events:       saved ? EventSystem.fromSave(saved.eventLog ? { history: saved.eventLog } : {})
-                        : EventSystem.createState(),
-    morale:       saved?.morale      ? MoraleSystem.fromSave(saved.morale)       : MoraleSystem.create(),
-    merchant:     saved?.merchant    ? MerchantSystem.fromSave(saved.merchant)   : MerchantSystem.createState(),
-    achievements: saved?.achievements? AchievementSystem.fromSave(saved.achievements) : AchievementSystem.createState(),
-
+    era: saved?.era ?? 0,
+    prevEra: saved?.era ?? 0,
+    tribe,
+    resources,
+    buildings,
+    events,
+    morale,
+    merchant,
+    achievements,
+    villagers: initVillagers(saved?.villagers, tribe.population, startTile),
+    selectedVillagerId: saved?.selectedVillagerId ?? null,
     buildingsPlacedTotal: saved?.buildingsPlacedTotal ?? 0,
-    eventLog:       saved?.eventLog      ?? [],
-    exploredTiles:  saved?.exploredTiles ?? [],
+    eventLog: saved?.eventLog ?? [],
+    exploredTiles: saved?.exploredTiles ?? [],
     paused: false,
+    merchantBlueprints: saved?.merchantBlueprints ?? [],
+    runStats: {
+      maxPopulation: saved?.runStats?.maxPopulation ?? tribe.population,
+      minPopulation: saved?.runStats?.minPopulation ?? tribe.population,
+      specialFinds: saved?.runStats?.specialFinds ?? 0,
+      merchantTrades: saved?.runStats?.merchantTrades ?? 0,
+      nearDeathTurns: saved?.runStats?.nearDeathTurns ?? 0,
+      lastStandUsed: saved?.runStats?.lastStandUsed ?? false,
+      comebackScore: saved?.runStats?.comebackScore ?? 0,
+      populationRecovered: saved?.runStats?.populationRecovered ?? 0,
+      objective: saved?.runStats?.objective || 'Reach Day 50 and keep the tribe alive.',
+      causeOfDeath: saved?.runStats?.causeOfDeath || '',
+      insaneMoments: saved?.runStats?.insaneMoments ?? [],
+    },
   };
 
   ResourceSystem.recalcCaps(G.resources, BuildingSystem.getStorageCount(G.buildings));
+  syncVillagersToPopulation();
+  if (!G.selectedVillagerId && G.villagers[0]) G.selectedVillagerId = G.villagers[0].id;
   UISystem.setWorld(G.world, G);
+}
+
+function initVillagers(savedVillagers, population, startTile) {
+  if (Array.isArray(savedVillagers) && savedVillagers.length) return savedVillagers;
+  const workers = Math.max(1, Math.min(8, Math.ceil(population / 3)));
+  const villagers = [];
+  for (let i = 0; i < workers; i++) {
+    villagers.push({
+      id: 'v' + (i + 1),
+      name: 'Villager ' + (i + 1),
+      x: startTile?.x ?? 0,
+      y: startTile?.y ?? 0,
+      task: null,
+      lastResult: 'Idle',
+    });
+  }
+  return villagers;
+}
+
+function syncVillagersToPopulation() {
+  if (!G) return;
+  const desired = Math.max(1, Math.min(8, Math.ceil(G.tribe.population / 3)));
+  const startTile = WorldGen.findStartTile(G.world);
+
+  while (G.villagers.length < desired) {
+    const idx = G.villagers.length + 1;
+    G.villagers.push({
+      id: 'v' + idx,
+      name: 'Villager ' + idx,
+      x: startTile?.x ?? 0,
+      y: startTile?.y ?? 0,
+      task: null,
+      lastResult: 'Idle',
+    });
+  }
+  while (G.villagers.length > desired) {
+    const removed = G.villagers.pop();
+    if (removed && G.selectedVillagerId === removed.id) G.selectedVillagerId = G.villagers[0]?.id || null;
+  }
+}
+
+function getSelectedVillager() {
+  return G?.villagers?.find(v => v.id === G.selectedVillagerId) || null;
 }
 
 function forceFirstRender() {
   requestAnimationFrame(() => requestAnimationFrame(() => {
     const vp = document.getElementById('map-viewport');
     const cv = document.getElementById('game-canvas');
-    cv.width  = vp.clientWidth  || window.innerWidth;
+    cv.width = vp.clientWidth || window.innerWidth;
     cv.height = vp.clientHeight || Math.floor(window.innerHeight * 0.52);
     UISystem.recalcLayout();
     fullRender();
@@ -134,92 +208,153 @@ function makePRNG(seed) {
   };
 }
 
-// =============================================
-// TURN LOOP
-// =============================================
-
 function endTurn() {
   if (!G || G.paused) return;
   SoundSystem.play('endturn');
 
-  // ---- Time ----
   G.day++;
-  if (G.day > G.year * 360 + 360) G.year++;
-  G.season  = Math.floor(((G.day - 1) % 120) / 30);
+  G.year = Math.floor((G.day - 1) / 120) + 1;
+  G.season = Math.floor(((G.day - 1) % 120) / 30);
   G.prevEra = G.era;
 
-  // ---- Resource regrowth ----
   ResourceSystem.processTurnRegrowth(G.world.tiles);
 
-  // ---- Building passives ----
-  BuildingSystem.processTurn(G.buildings, G.resources);
+  const buildingMessages = BuildingSystem.processTurn(G.buildings, G.resources, G.morale);
+  const buildingProxy = BuildingSystem.createProxy(G.buildings);
+  const pressureMessages = ResourceSystem.applyTurnPressure(G.resources, G.season, G.tribe.population, buildingProxy);
+  const villagerMessages = processVillagersTurn();
 
-  // ---- Events ----
-  const disasterWasActive = !!(G.events.activeEvent);
   const eventMsgs = EventSystem.processTurn(
     G.events, G.world, G.tribe, G.resources, G.buildings, G.day, G.season, rng
   );
-  const disasterFiredThisTurn = !!(G.events.activeEvent);
 
+  const disasterFiredThisTurn = !!G.events.activeEvent;
   if (disasterFiredThisTurn) {
     SoundSystem.play('disaster');
     spawnParticlesBurst(null, 'disaster');
   }
 
-  // ---- Merchant ----
-  const merchantMsgs = MerchantSystem.processTurn(G.merchant, G.resources, G.era, rng);
+  const merchantMsgs = MerchantSystem.processTurn(G.merchant, G.resources, G.era, rng, G.morale, buildingProxy);
   if (merchantMsgs.some(m => m.banner)) {
     SoundSystem.play('merchant');
     updateMerchantBanner();
   }
 
-  // ---- Tribe ----
-  const buildingProxy = BuildingSystem.createProxy(G.buildings);
   const moraleMultipliers = {
     growth: MoraleSystem.growthMultiplier(G.morale),
-    decay:  MoraleSystem.decayMultiplier(G.morale),
+    decay: MoraleSystem.decayMultiplier(G.morale),
+    death: MoraleSystem.getDeathMultiplier(G.morale),
   };
+
   const tribeResult = TribeSystem.processTurn(
     G.tribe, G.resources, buildingProxy, G.season, disasterFiredThisTurn, moraleMultipliers
   );
 
   if (tribeResult.deaths > 0) SoundSystem.play('death');
-  if (tribeResult.grew   > 0) SoundSystem.play('growth');
+  if (tribeResult.grew > 0) SoundSystem.play('growth');
 
-  // ---- Morale ----
-  MoraleSystem.processTurn(G.morale, tribeResult, disasterFiredThisTurn, G.era, G.prevEra);
+  MoraleSystem.processTurn(G.morale, tribeResult, disasterFiredThisTurn, G.era, G.prevEra, buildingProxy);
 
-  // ---- World passive ----
+  maybeTriggerLastStand(tribeResult);
   EventSystem.processWorldPassive(G.world);
-
-  // ---- Era ----
   processEra();
+  syncVillagersToPopulation();
+  updateRunStats(tribeResult);
 
-  // ---- Achievements ----
   const newAchievements = AchievementSystem.checkAll(G);
   for (const ach of newAchievements) {
     SoundSystem.play('achievement');
     showAchievementToast(ach);
   }
 
-  // ---- Log all messages ----
-  const allMsgs = [...eventMsgs, ...merchantMsgs, ...tribeResult.messages];
+  const allMsgs = [...buildingMessages, ...pressureMessages, ...villagerMessages, ...eventMsgs, ...merchantMsgs, ...tribeResult.messages];
   for (const msg of allMsgs) UISystem.logGather(msg);
 
-  // ---- Auto-save every 5 turns ----
   if (G.day % 5 === 0) autoSave();
 
-  // ---- Game over? ----
-  if (tribeResult.gameOver || G.tribe.population <= 0) { gameOver(); return; }
+  if (tribeResult.gameOver || G.tribe.population <= 0) {
+    G.runStats.causeOfDeath = tribeResult.cause || G.tribe.causeOfDeath || 'The mountain won.';
+    gameOver();
+    return;
+  }
 
-  // ---- Render ----
   fullRender();
   updateMerchantBanner();
 }
 
+function processVillagersTurn() {
+  if (!G) return [];
+  const msgs = [];
+  const gatherMultiplier = MoraleSystem.getGatherMultiplier(G.morale);
+
+  for (const villager of G.villagers) {
+    if (!villager.task || villager.task.type !== 'gather') {
+      villager.lastResult = 'Idle';
+      continue;
+    }
+    const tile = WorldGen.getTile(G.world, villager.task.x, villager.task.y);
+    if (!tile) {
+      villager.task = null;
+      villager.lastResult = 'Lost task';
+      continue;
+    }
+    villager.x = tile.x;
+    villager.y = tile.y;
+
+    if (tile.buildingId) {
+      villager.lastResult = 'Blocked by building';
+      continue;
+    }
+
+    const bonus = BuildingSystem.getGatherBonus(G.buildings, tile.type);
+    const gained = ResourceSystem.gatherTile(tile, G.resources, G.season, bonus, gatherMultiplier);
+    if (gained) {
+      SoundSystem.play('gather');
+      const parts = [];
+      if (gained.food > 0) parts.push('+' + gained.food + ' 🌿');
+      if (gained.wood > 0) parts.push('+' + gained.wood + ' 🌲');
+      if (gained.stone > 0) parts.push('+' + gained.stone + ' 🪨');
+      villager.lastResult = parts.join(' ');
+      msgs.push({ text: `🧍 ${villager.name} gathered ${parts.join(' ')}`, type: 'good' });
+    } else {
+      villager.lastResult = 'Nothing left here';
+    }
+  }
+  return msgs;
+}
+
+function maybeTriggerLastStand(tribeResult) {
+  if (!G || G.runStats.lastStandUsed) return;
+  if (G.tribe.population > 2) return;
+
+  G.runStats.lastStandUsed = true;
+  G.runStats.insaneMoments.push('Last Stand activated');
+  G.runStats.comebackScore += 15;
+  G.morale.morale = Math.min(100, G.morale.morale + 20);
+  G.resources.food = Math.min(G.resources.maxFood, G.resources.food + 8);
+  G.resources.wood = Math.min(G.resources.maxWood, G.resources.wood + 5);
+  UISystem.toast('🔥 LAST STAND ACTIVATED', 2600);
+  UISystem.logGather({ text: '🔥 Last Stand: the tribe rallied, scavenged supplies, and refused to die.', type: 'good' });
+}
+
+function updateRunStats(tribeResult) {
+  G.runStats.maxPopulation = Math.max(G.runStats.maxPopulation, G.tribe.population);
+  G.runStats.minPopulation = Math.min(G.runStats.minPopulation, G.tribe.population);
+  if (G.tribe.population <= 2) G.runStats.nearDeathTurns++;
+  G.runStats.populationRecovered = Math.max(G.runStats.populationRecovered, G.tribe.population - G.runStats.minPopulation);
+  G.runStats.comebackScore = G.runStats.nearDeathTurns * 2 + (G.runStats.lastStandUsed ? 10 : 0) + G.runStats.populationRecovered;
+
+  if (G.day >= 50 && !G.runStats.insaneMoments.includes('Reached Day 50')) {
+    G.runStats.insaneMoments.push('Reached Day 50');
+  }
+  if (G.runStats.maxPopulation >= 20 && !G.runStats.insaneMoments.includes('Village surge')) {
+    G.runStats.insaneMoments.push('Village surge');
+  }
+}
+
 function processEra() {
   const thresholds = [0, 60, 150, 300];
-  const names      = ['Stone Age', 'Bronze Age', 'Iron Age', 'Classical Age'];
+  const names = ['Stone Age', 'Bronze Age', 'Iron Age', 'Classical Age'];
   for (let i = thresholds.length - 1; i >= 0; i--) {
     if (G.day >= thresholds[i] && G.era < i) {
       G.era = i;
@@ -230,37 +365,63 @@ function processEra() {
   }
 }
 
-// =============================================
-// TILE TAP
-// =============================================
-
 function onTileTap(tile) {
   if (!G) return;
+  claimDiscoveryReward(tile);
+
   const def = WorldGen.TILE_DEFS[tile.type];
-  if (currentMode === 'gather') handleGather(tile, def);
+  if (currentMode === 'gather') handleAssignVillager(tile, def);
   else if (currentMode === 'build') handleBuild(tile, def);
-  UISystem.updateInfoPanel(G.tribe, G.resources, G.buildings);
+
+  UISystem.updateInfoPanel(G.tribe, G.resources, G.buildings, G.morale, G.runStats, G.seed);
 }
 
-function handleGather(tile, def) {
-  if (!def.passable)    { UISystem.toast('Cannot gather here.'); return; }
+function claimDiscoveryReward(tile) {
+  if (!tile?.special || tile.specialClaimed) return;
+  tile.specialClaimed = true;
+  G.runStats.specialFinds++;
+  const label = WorldGen.SPECIALS[tile.special]?.name || 'Find';
+
+  switch (tile.special) {
+    case 'cache':
+      G.resources.food = Math.min(G.resources.maxFood, G.resources.food + 10);
+      G.resources.wood = Math.min(G.resources.maxWood, G.resources.wood + 6);
+      UISystem.toast(`📦 ${label}: +10 food, +6 wood`);
+      break;
+    case 'shrine':
+      G.morale.morale = Math.min(100, G.morale.morale + 15);
+      UISystem.toast(`✨ ${label}: morale surged`);
+      break;
+    case 'ruins':
+      G.resources.stone = Math.min(G.resources.maxStone, G.resources.stone + 12);
+      UISystem.toast(`🏛️ ${label}: +12 stone`);
+      break;
+    case 'survivors':
+      G.tribe.population += 2;
+      UISystem.toast(`🧍 ${label}: 2 survivors joined`);
+      syncVillagersToPopulation();
+      break;
+  }
+
+  G.runStats.insaneMoments.push(label);
+  UISystem.logGather({ text: `${WorldGen.SPECIALS[tile.special]?.emoji || '✨'} Discovered ${label}`, type: 'good' });
+}
+
+function handleAssignVillager(tile, def) {
+  if (!def.passable) { UISystem.toast('Cannot send villagers there.'); return; }
   if (tile.buildingId) {
-    const b    = G.buildings.placed[tile.buildingId];
+    const b = G.buildings.placed[tile.buildingId];
     const bDef = BuildingSystem.BUILDING_DEFS[b?.defId];
     UISystem.toast(`${bDef?.emoji || '🏗️'} ${bDef?.name} — ${bDef?.description}`);
     return;
   }
-  if (tile.depleted) { UISystem.toast('Tile depleted — recovering.'); return; }
 
-  const gained = ResourceSystem.gatherTile(tile, G.resources, G.season);
-  if (!gained)   { UISystem.toast(def.name + ' — nothing to gather.'); return; }
+  const villager = getSelectedVillager();
+  if (!villager) { UISystem.toast('Select a villager first.'); return; }
 
-  SoundSystem.play('gather');
-  const parts = [];
-  if (gained.food  > 0) parts.push('+' + gained.food  + ' 🌿');
-  if (gained.wood  > 0) parts.push('+' + gained.wood  + ' 🌲');
-  if (gained.stone > 0) parts.push('+' + gained.stone + ' 🪨');
-  UISystem.logGather({ text: (def.emoji||def.name) + ': ' + parts.join(' '), type:'good' });
+  villager.task = { type: 'gather', x: tile.x, y: tile.y };
+  villager.lastResult = `Assigned to ${def.name}`;
+  UISystem.toast(`🧍 ${villager.name} assigned to ${def.name}`);
   updateHUDAndRender();
 }
 
@@ -275,17 +436,13 @@ function handleBuild(tile, def) {
   const bDef = BuildingSystem.BUILDING_DEFS[selectedBuildDef];
   UISystem.logGather({ text: 'Built ' + bDef.emoji + ' ' + bDef.name, type: 'good' });
   UISystem.toast(bDef.emoji + ' ' + bDef.name + ' built!');
-  UISystem.revealAround(tile.x, tile.y, 2);
+  UISystem.revealAround(tile.x, tile.y, 2 + (BuildingSystem.getStrategySummary(G.buildings).revealRange || 0));
   SoundSystem.play('build');
   spawnParticlesBurst(tile, 'build');
 
   selectedBuildDef = null;
   updateHUDAndRender();
 }
-
-// =============================================
-// CONTROLS
-// =============================================
 
 function bindGameControls() {
   document.getElementById('btn-end-turn').addEventListener('click', endTurn);
@@ -295,23 +452,27 @@ function bindGameControls() {
     G.paused = !G.paused;
     document.getElementById('pause-menu').classList.toggle('hidden', !G.paused);
   });
+
   document.getElementById('btn-resume').addEventListener('click', () => {
     G.paused = false;
     document.getElementById('pause-menu').classList.add('hidden');
   });
+
   document.getElementById('btn-save-manual').addEventListener('click', () => {
-    autoSave(); UISystem.toast('💾 Game saved!');
+    autoSave();
+    UISystem.toast('💾 Game saved!');
   });
+
   document.getElementById('btn-abandon').addEventListener('click', () => {
     if (confirm('Abandon this run?')) {
-      SaveSystem.deleteSave(); G = null;
+      SaveSystem.deleteSave();
+      G = null;
       UISystem.showScreen('menu');
       document.getElementById('pause-menu').classList.add('hidden');
       document.getElementById('btn-continue').disabled = true;
     }
   });
 
-  // Festival
   document.getElementById('btn-festival').addEventListener('click', () => {
     if (!G) return;
     const result = MoraleSystem.holdFestival(G.morale, G.resources);
@@ -319,39 +480,41 @@ function bindGameControls() {
       SoundSystem.play('festival');
       UISystem.toast('🎉 Festival! Morale boosted!');
       UISystem.logGather({ text: '🎉 The tribe celebrates!', type: 'good' });
-      G.achievements._merchantTraded = true; // reuse flag for festival
       updateHUDAndRender();
     } else {
       UISystem.toast('❌ ' + result.reason);
     }
   });
 
-  // Sound toggle
   document.getElementById('btn-sound').addEventListener('click', () => {
     const nowEnabled = !SoundSystem.isEnabled();
     SoundSystem.setEnabled(nowEnabled);
     document.getElementById('btn-sound').textContent = nowEnabled ? '🔊' : '🔇';
   });
 
-  // Mode tabs
   document.querySelectorAll('.mode-tab').forEach(tab => {
     tab.addEventListener('click', () => {
       currentMode = tab.dataset.mode;
       UISystem.setMode(currentMode);
       if (currentMode === 'build' && G) refreshBuildPanel();
-      if (currentMode === 'info' && G) UISystem.updateInfoPanel(G.tribe, G.resources, G.buildings);
+      if (currentMode === 'info' && G) UISystem.updateInfoPanel(G.tribe, G.resources, G.buildings, G.morale, G.runStats, G.seed);
       if (currentMode === 'trade' && G) updateTradePanel();
       if (currentMode === 'achievements' && G) updateAchievementsPanel();
+      if (currentMode === 'gather' && G) refreshGatherPanel();
     });
   });
 
-  // Leaderboard submit on game over screen
   document.getElementById('btn-submit-score').addEventListener('click', submitLeaderboardScore);
 }
 
-// =============================================
-// TRADE PANEL
-// =============================================
+function refreshGatherPanel() {
+  if (!G) return;
+  UISystem.updateGatherPanel(G.villagers, G.selectedVillagerId, villagerId => {
+    G.selectedVillagerId = villagerId;
+    refreshGatherPanel();
+    UISystem.render();
+  });
+}
 
 function updateTradePanel() {
   const el = document.getElementById('trade-content');
@@ -371,16 +534,17 @@ function updateTradePanel() {
 
   for (const trade of G.merchant.trades) {
     const label = MerchantSystem.getTradeLabel(trade);
-    const canDo = ResourceSystem.canAfford(G.resources, { [trade.give]: trade.giveAmt });
+    const canDo = trade.give === 'morale' ? true : ResourceSystem.canAfford(G.resources, { [trade.give]: trade.giveAmt });
     const div = document.createElement('div');
     div.className = 'trade-card';
     div.innerHTML = `
       <span class="trade-label">${label}</span>
       <button class="btn btn-primary" ${canDo ? '' : 'disabled'}>TRADE</button>`;
     div.querySelector('button').addEventListener('click', () => {
-      const res = MerchantSystem.executeTrade(G.merchant, trade.id, G.resources, G.morale);
+      const res = MerchantSystem.executeTrade(G.merchant, trade.id, G.resources, G.morale, G);
       if (res.ok) {
         G.achievements._merchantTraded = true;
+        G.runStats.merchantTrades++;
         SoundSystem.play('merchant');
         UISystem.toast('🐪 Trade complete!');
         updateTradePanel();
@@ -405,17 +569,12 @@ function updateMerchantBanner() {
   }
 }
 
-// =============================================
-// ACHIEVEMENTS PANEL
-// =============================================
-
 function updateAchievementsPanel() {
   const el = document.getElementById('achievements-content');
   if (!el || !G) return;
   const all = AchievementSystem.getAll(G.achievements.unlocked);
   el.innerHTML = '';
-  // Unlocked first, then locked
-  const sorted = [...all.filter(a=>a.unlocked), ...all.filter(a=>!a.unlocked)];
+  const sorted = [...all.filter(a => a.unlocked), ...all.filter(a => !a.unlocked)];
   for (const ach of sorted) {
     const div = document.createElement('div');
     div.className = 'achievement-item' + (ach.unlocked ? ' unlocked' : '');
@@ -437,15 +596,11 @@ function showAchievementToast(ach) {
   setTimeout(() => el.remove(), 3000);
 }
 
-// =============================================
-// PARTICLES
-// =============================================
-
 function resizeParticleCanvas() {
   const pc = document.getElementById('particle-canvas');
   const vp = document.getElementById('map-viewport');
   if (!pc || !vp) return;
-  pc.width  = vp.clientWidth  || window.innerWidth;
+  pc.width = vp.clientWidth || window.innerWidth;
   pc.height = vp.clientHeight || 300;
 }
 
@@ -453,54 +608,46 @@ function spawnParticlesBurst(tile, type) {
   const pc = document.getElementById('particle-canvas');
   if (!pc || !G) return;
 
-  let cx = pc.width  / 2;
+  let cx = pc.width / 2;
   let cy = pc.height / 2;
-
-  // If a tile was given, try to get its screen position
   if (tile) {
-    // We don't have direct access to UISystem internals, use centre as fallback
-    // (A future improvement: expose UISystem.tileToScreen(tile))
+    cx = pc.width / 2;
+    cy = pc.height / 2;
   }
 
-  const count  = type === 'disaster' ? 30 : 18;
-  const colors = type === 'disaster'
-    ? ['#e74c3c', '#e67e22', '#f39c12', '#c0392b']
-    : ['#f39c12', '#2ecc71', '#3498db', '#ecf0f1'];
+  const count = type === 'disaster' ? 34 : 18;
+  const palette = type === 'disaster' ? ['#f39c12', '#e74c3c', '#ecf0f1'] : ['#e67e22', '#f1c40f', '#ecf0f1'];
 
   for (let i = 0; i < count; i++) {
-    const angle = Math.random() * Math.PI * 2;
-    const speed = 1.5 + Math.random() * 3.5;
     particles.push({
-      x: cx, y: cy,
-      vx: Math.cos(angle) * speed,
-      vy: Math.sin(angle) * speed - (type === 'disaster' ? 0 : 2),
+      x: cx,
+      y: cy,
+      vx: (Math.random() - 0.5) * (type === 'disaster' ? 7 : 4),
+      vy: (Math.random() - 0.5) * (type === 'disaster' ? 7 : 4),
       life: 1,
-      decay: 0.025 + Math.random() * 0.03,
-      radius: 2 + Math.random() * 4,
-      color: colors[Math.floor(Math.random() * colors.length)],
+      decay: 0.015 + Math.random() * 0.02,
+      radius: 2 + Math.random() * 2.5,
+      color: palette[Math.floor(Math.random() * palette.length)],
     });
   }
 
-  if (particles.length > 0 && !particleRAF) tickParticles();
+  if (!particleRAF) particleRAF = requestAnimationFrame(tickParticles);
 }
 
-let particleRAF = null;
-
 function tickParticles() {
-  const pc  = document.getElementById('particle-canvas');
-  if (!pc) { particleRAF = null; return; }
+  const pc = document.getElementById('particle-canvas');
+  if (!pc) return;
   const pctx = pc.getContext('2d');
-
   pctx.clearRect(0, 0, pc.width, pc.height);
 
   particles = particles.filter(p => p.life > 0);
   for (const p of particles) {
-    p.x    += p.vx;
-    p.y    += p.vy;
-    p.vy   += 0.12; // gravity
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vy += 0.12;
     p.life -= p.decay;
     pctx.globalAlpha = Math.max(0, p.life);
-    pctx.fillStyle   = p.color;
+    pctx.fillStyle = p.color;
     pctx.beginPath();
     pctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
     pctx.fill();
@@ -515,10 +662,6 @@ function tickParticles() {
   }
 }
 
-// =============================================
-// LEADERBOARD
-// =============================================
-
 function submitLeaderboardScore() {
   const nameInput = document.getElementById('leaderboard-name-input');
   const name = (nameInput?.value || '').trim() || 'Survivor';
@@ -529,8 +672,16 @@ function submitLeaderboardScore() {
   if (!stats) return;
 
   LeaderboardSystem.submitScore(
-    { name, days: stats.day, seed: stats.seed, era: stats.era },
-    ({ ok, rank, error }) => {
+    {
+      name,
+      days: stats.day,
+      seed: stats.seed,
+      era: stats.era,
+      populationPeak: stats.populationPeak,
+      comebackScore: stats.comebackScore,
+      strategy: stats.strategy,
+    },
+    ({ ok, rank }) => {
       if (ok) {
         if (statusEl) statusEl.textContent = `You ranked #${rank}! 🏆`;
         loadAndShowLeaderboard(rank);
@@ -548,51 +699,65 @@ function loadAndShowLeaderboard(highlightRank) {
     listEl.innerHTML = '';
 
     const ERA_NAMES = ['Stone', 'Bronze', 'Iron', 'Classical'];
+    const sections = [
+      { title: 'Longest Survival', data: [...scores].sort((a,b) => (b.days||0) - (a.days||0)).slice(0,5), metric: s => `${s.days || 0}d` },
+      { title: 'Highest Population', data: [...scores].sort((a,b) => (b.populationPeak||0) - (a.populationPeak||0)).slice(0,5), metric: s => `${s.populationPeak || 0} pop` },
+      { title: 'Best Comebacks', data: [...scores].sort((a,b) => (b.comebackScore||0) - (a.comebackScore||0)).slice(0,5), metric: s => `${s.comebackScore || 0} pts` },
+    ];
 
-    scores.forEach((s, i) => {
-      const row = document.createElement('div');
-      row.className = 'lb-row' + (highlightRank === i + 1 ? ' highlight' : '');
-      row.innerHTML = `
-        <span class="lb-rank">#${i+1}</span>
-        <span class="lb-name">${s.name}</span>
-        <span class="lb-days">${s.days}d</span>
-        <span style="font-size:10px;color:var(--text-dim);margin-left:4px">${ERA_NAMES[s.era]||''}</span>`;
-      listEl.appendChild(row);
+    let any = false;
+    sections.forEach(section => {
+      const box = document.createElement('div');
+      box.className = 'lb-section';
+      box.innerHTML = `<div class="lb-section-title">${section.title}</div>`;
+      if (!section.data.length) {
+        box.innerHTML += '<p style="font-size:12px;color:var(--text-dim)">No scores yet.</p>';
+      } else {
+        section.data.forEach((s, i) => {
+          any = true;
+          const row = document.createElement('div');
+          row.className = 'lb-row' + (highlightRank === i + 1 && section.title === 'Longest Survival' ? ' highlight' : '');
+          row.innerHTML = `
+            <span class="lb-rank">#${i+1}</span>
+            <span class="lb-name">${s.name}</span>
+            <span class="lb-days">${section.metric(s)}</span>
+            <span style="font-size:10px;color:var(--text-dim);margin-left:4px">${ERA_NAMES[s.era] || ''}</span>`;
+          box.appendChild(row);
+        });
+      }
+      listEl.appendChild(box);
     });
 
-    if (scores.length === 0) {
+    if (!any) {
       listEl.innerHTML = '<p style="font-size:12px;color:var(--text-dim)">No scores yet. Be the first!</p>';
     }
   });
 }
 
-// =============================================
-// RENDERING
-// =============================================
-
 function fullRender() {
   if (!G) return;
   const vp = document.getElementById('map-viewport');
-  if (vp && vp.clientHeight > 0 && document.getElementById('game-canvas').height === 0) {
-    UISystem.recalcLayout();
-  }
+  if (vp && vp.clientHeight > 0 && document.getElementById('game-canvas').height === 0) UISystem.recalcLayout();
   UISystem.render();
-  UISystem.updateHUD(G.tribe, G.resources, G.day, G.year, G.season, G.era, G.morale);
-  UISystem.updateInfoPanel(G.tribe, G.resources, G.buildings);
+  UISystem.updateHUD(G.tribe, G.resources, G.day, G.year, G.season, G.era, G.morale, G.seed, G.runStats);
+  UISystem.updateInfoPanel(G.tribe, G.resources, G.buildings, G.morale, G.runStats, G.seed);
   UISystem.updateEventBanner(EventSystem.getPendingWarning(G.events));
   updateMoraleHUD();
-  if (currentMode === 'build')         refreshBuildPanel();
-  if (currentMode === 'trade')         updateTradePanel();
-  if (currentMode === 'achievements')  updateAchievementsPanel();
+  if (currentMode === 'build') refreshBuildPanel();
+  if (currentMode === 'trade') updateTradePanel();
+  if (currentMode === 'achievements') updateAchievementsPanel();
+  if (currentMode === 'gather') refreshGatherPanel();
 }
 
 function updateHUDAndRender() {
   if (!G) return;
   UISystem.render();
-  UISystem.updateHUD(G.tribe, G.resources, G.day, G.year, G.season, G.era, G.morale);
+  UISystem.updateHUD(G.tribe, G.resources, G.day, G.year, G.season, G.era, G.morale, G.seed, G.runStats);
+  UISystem.updateInfoPanel(G.tribe, G.resources, G.buildings, G.morale, G.runStats, G.seed);
   updateMoraleHUD();
   if (currentMode === 'build') refreshBuildPanel();
   if (currentMode === 'trade') updateTradePanel();
+  if (currentMode === 'gather') refreshGatherPanel();
 }
 
 function updateMoraleHUD() {
@@ -601,63 +766,78 @@ function updateMoraleHUD() {
   if (!fill) return;
   const m = G.morale.morale;
   const color = m >= 60 ? '#2ecc71' : m >= 30 ? '#f39c12' : '#c0392b';
-  fill.style.width      = m + '%';
+  fill.style.width = m + '%';
   fill.style.background = color;
-  fill.title = MoraleSystem.getLabel(m);
+  fill.title = MoraleSystem.getLabel(m) + ' · ' + (G.morale.lastEffects || '');
 }
 
 function refreshBuildPanel() {
-  UISystem.updateBuildPanel(G.era, G.resources, selectedBuildDef, defId => {
+  UISystem.updateBuildPanel(G.era, G.resources, selectedBuildDef, G.merchantBlueprints, defId => {
     selectedBuildDef = defId;
-    UISystem.updateBuildPanel(G.era, G.resources, selectedBuildDef, () => {});
+    UISystem.updateBuildPanel(G.era, G.resources, selectedBuildDef, G.merchantBlueprints, () => {});
   });
 }
-
-// =============================================
-// SAVE
-// =============================================
 
 function autoSave() {
   if (!G) return;
   const ok = SaveSystem.save({
     seed: G.seed, day: G.day, year: G.year, season: G.season, era: G.era,
-    tribe:          G.tribe,
-    resources:      G.resources,
-    worldTiles:     G.world.tiles,
-    buildings:      G.buildings,
-    eventLog:       G.eventLog,
-    exploredTiles:  G.exploredTiles || [],
+    tribe: G.tribe,
+    resources: G.resources,
+    worldTiles: G.world.tiles,
+    buildings: G.buildings,
+    events: G.events,
+    eventLog: G.eventLog,
+    exploredTiles: G.exploredTiles || [],
     growthAccumulator: TribeSystem.getAccumulator(),
-    morale:         G.morale,
-    merchant:       G.merchant,
-    achievements:   G.achievements,
+    morale: G.morale,
+    merchant: G.merchant,
+    achievements: G.achievements,
     buildingsPlacedTotal: G.buildingsPlacedTotal,
+    villagers: G.villagers,
+    selectedVillagerId: G.selectedVillagerId,
+    runStats: G.runStats,
+    merchantBlueprints: G.merchantBlueprints,
   });
   const ind = document.getElementById('btn-autosave-indicator');
-  if (ind) { ind.textContent = ok ? '💾' : '❌'; setTimeout(()=>{ if(ind) ind.textContent='💾'; }, 1500); }
+  if (ind) {
+    ind.textContent = ok ? '💾' : '❌';
+    setTimeout(() => { if (ind) ind.textContent = '💾'; }, 1500);
+  }
   if (ok) document.getElementById('btn-continue').disabled = false;
 }
 
-// =============================================
-// GAME OVER
-// =============================================
-
 function gameOver() {
+  const strategy = BuildingSystem.getDominantStrategy(G.buildings);
   const stats = {
-    day:    G.day,   year:   G.year,
-    season: G.season, era:   G.era,
-    seed:   G.seed,
-    tilesExplored:   UISystem.getExploredCount(),
+    day: G.day,
+    year: G.year,
+    season: G.season,
+    era: G.era,
+    seed: G.seed,
+    tilesExplored: UISystem.getExploredCount(),
     buildingsPlaced: G.buildingsPlacedTotal,
+    populationPeak: G.runStats.maxPopulation,
+    specialFinds: G.runStats.specialFinds,
+    cause: G.runStats.causeOfDeath || G.tribe.causeOfDeath || 'The mountain won.',
+    strategy,
+    comebackScore: G.runStats.comebackScore,
+    insaneMoments: G.runStats.insaneMoments.slice(-4),
+    epitaph: buildEpitaph(),
   };
   window._lastGameOverStats = stats;
 
   UISystem.showGameOver(stats);
   SaveSystem.deleteSave();
   document.getElementById('btn-continue').disabled = true;
-
-  // Load leaderboard scores for display (submit is user-triggered)
   loadAndShowLeaderboard(null);
-
   G = null;
+}
+
+function buildEpitaph() {
+  if (!G) return '';
+  if (G.day >= 100) return 'You didn’t just survive. You became a mountain legend.';
+  if (G.runStats.lastStandUsed) return 'This run should have been over. Somehow it wasn’t.';
+  if (G.season === 3) return 'Winter finally got its due.';
+  return 'The summit remembers every bad decision.';
 }
