@@ -1,53 +1,38 @@
 /**
- * MAIN.JS — Game Orchestrator
- * ----------------------------
- * Ties all systems together. Manages game state, turn loop,
- * input routing, save/load lifecycle, and screen transitions.
- *
- * Architecture:
- *   main.js = thin orchestrator
- *   game/*.js = systems (no knowledge of each other)
- *   ui.js = rendering + input → dispatches to main.js callbacks
- *
- * To extend:
- *   - Add new systems in game/ and wire them in newGame() + endTurn()
- *   - Add era unlock logic in processEra()
+ * MAIN.JS v2 — Game Orchestrator
+ * --------------------------------
+ * Wires all systems: world, tribe, resources, buildings, events,
+ * morale, merchant, achievements, sound, particles, leaderboard.
  */
 
-// =============================================
-// GAME STATE (single source of truth)
-// =============================================
-let G = null; // active game state — null when on menus
+let G    = null;
+let rng  = null;
+let currentMode      = 'gather';
+let selectedBuildDef = null;
 
-// Seeded PRNG for runtime randomness (separate from world gen)
-let rng = null;
-
-// Current UI mode: 'gather' | 'build'
-let currentMode = 'gather';
-let selectedBuildDef = null;  // building type selected in Build panel
+// Particle system state (canvas-based, lives in main for simplicity)
+let particles = [];
 
 // =============================================
-// INITIALISATION
+// INIT
 // =============================================
 
 window.addEventListener('DOMContentLoaded', () => {
-  initMenu();
   UISystem.init(document.getElementById('game-canvas'), onTileTap);
+  SoundSystem.init();
+  initMenu();
   bindGameControls();
 
-  // Check for existing save to enable Continue button
   if (SaveSystem.hasSave()) {
     document.getElementById('btn-continue').disabled = false;
   }
 
-  // Handle window resize / orientation change
   window.addEventListener('resize', () => {
-    if (G) {
-      UISystem.recalcLayout();
-      UISystem.setWorld(G.world, G);
-      UISystem.render();
-    }
+    if (G) { UISystem.recalcLayout(); UISystem.setWorld(G.world, G); UISystem.render(); }
   });
+
+  // Particle canvas sizing
+  window.addEventListener('resize', resizeParticleCanvas);
 });
 
 // =============================================
@@ -56,29 +41,13 @@ window.addEventListener('DOMContentLoaded', () => {
 
 function initMenu() {
   document.getElementById('btn-new-game').addEventListener('click', () => {
-    const seed = document.getElementById('seed-input').value.trim();
-    startNewGame(seed);
+    startNewGame(document.getElementById('seed-input').value.trim());
   });
-
-  document.getElementById('btn-continue').addEventListener('click', () => {
-    loadGame();
-  });
-
-  document.getElementById('btn-how-to-play').addEventListener('click', () => {
-    UISystem.showScreen('howto');
-  });
-
-  document.getElementById('btn-howto-back').addEventListener('click', () => {
-    UISystem.showScreen('menu');
-  });
-
-  document.getElementById('btn-new-after-death').addEventListener('click', () => {
-    UISystem.showScreen('menu');
-  });
-
-  document.getElementById('btn-menu-after-death').addEventListener('click', () => {
-    UISystem.showScreen('menu');
-  });
+  document.getElementById('btn-continue').addEventListener('click', loadGame);
+  document.getElementById('btn-how-to-play').addEventListener('click', () => UISystem.showScreen('howto'));
+  document.getElementById('btn-howto-back').addEventListener('click', () => UISystem.showScreen('menu'));
+  document.getElementById('btn-new-after-death').addEventListener('click', () => UISystem.showScreen('menu'));
+  document.getElementById('btn-menu-after-death').addEventListener('click', () => UISystem.showScreen('menu'));
 }
 
 // =============================================
@@ -87,88 +56,76 @@ function initMenu() {
 
 function startNewGame(seedStr) {
   const world = WorldGen.generate(seedStr);
-  initGameState(world, null); // fresh state
+  initGameState(world, null);
   SaveSystem.deleteSave();
   UISystem.showScreen('game');
-  UISystem.toast('⛰️ New expedition begun — Seed: ' + world.seed);
-  fullRender();
+  resizeParticleCanvas();
+  UISystem.toast('⛰️ New expedition — Seed: ' + world.seed);
+  forceFirstRender();
 }
 
 function loadGame() {
   const saved = SaveSystem.load();
-  if (!saved) {
-    UISystem.toast('No valid save found.');
-    return;
-  }
-
-  // Re-generate world from seed (tiles are saved too but re-generating
-  // is cheap and ensures world structure integrity)
+  if (!saved) { UISystem.toast('No valid save found.'); return; }
   const world = WorldGen.generate(saved.seed);
-
-  // Overwrite tile states from save (depleted, buildings, type changes)
-  for (const savedTile of saved.worldTiles) {
-    const tile = WorldGen.getTile(world, savedTile.x, savedTile.y);
-    if (tile) {
-      tile.depleted   = savedTile.depleted;
-      tile.type       = savedTile.type;
-      tile.buildingId = savedTile.buildingId;
-    }
+  for (const st of saved.worldTiles) {
+    const tile = WorldGen.getTile(world, st.x, st.y);
+    if (tile) { tile.depleted = st.depleted; tile.type = st.type; tile.buildingId = st.buildingId; }
   }
-
   initGameState(world, saved);
   UISystem.showScreen('game');
-  UISystem.toast(`📂 Resumed — Day ${G.day}`);
-  fullRender();
+  resizeParticleCanvas();
+  UISystem.toast('📂 Resumed — Day ' + G.day);
+  forceFirstRender();
 }
 
 function initGameState(world, saved) {
-  // Seed the runtime RNG with the world seed + day offset
   const dayOffset = saved ? saved.day : 0;
-  const rngSeed   = (world.numericSeed + dayOffset * 7919) >>> 0;
-  rng = makePRNG(rngSeed);
+  rng = makePRNG((world.numericSeed + dayOffset * 7919) >>> 0);
 
   G = {
     world,
-    seed: world.seed,
+    seed:   world.seed,
+    day:    saved?.day    ?? 1,
+    year:   saved?.year   ?? 1,
+    season: saved?.season ?? 0,
+    era:    saved?.era    ?? 0,
+    prevEra: saved?.era   ?? 0,
 
-    // Time
-    day:    saved ? saved.day    : 1,
-    year:   saved ? saved.year   : 1,
-    season: saved ? saved.season : 0,  // 0=Spring…3=Winter
-    era:    saved ? saved.era    : 0,
+    tribe:        saved ? TribeSystem.fromSave(saved.tribe)           : TribeSystem.create(),
+    resources:    saved ? ResourceSystem.fromSave(saved.resources)    : ResourceSystem.create(),
+    buildings:    saved ? BuildingSystem.fromSave(saved.buildings)     : BuildingSystem.create(),
+    events:       saved ? EventSystem.fromSave(saved.eventLog ? { history: saved.eventLog } : {})
+                        : EventSystem.createState(),
+    morale:       saved?.morale      ? MoraleSystem.fromSave(saved.morale)       : MoraleSystem.create(),
+    merchant:     saved?.merchant    ? MerchantSystem.fromSave(saved.merchant)   : MerchantSystem.createState(),
+    achievements: saved?.achievements? AchievementSystem.fromSave(saved.achievements) : AchievementSystem.createState(),
 
-    // Systems
-    tribe:     saved ? TribeSystem.fromSave(saved.tribe)        : TribeSystem.create(),
-    resources: saved ? ResourceSystem.fromSave(saved.resources) : ResourceSystem.create(),
-    buildings: saved ? BuildingSystem.fromSave(saved.buildings)  : BuildingSystem.create(),
-    events:    saved ? EventSystem.fromSave(saved.eventLog ? { history: saved.eventLog } : {})
-                     : EventSystem.createState(),
-
-    // Meta
-    buildingsPlacedTotal: 0,
-    eventLog: saved ? (saved.eventLog || []) : [],
+    buildingsPlacedTotal: saved?.buildingsPlacedTotal ?? 0,
+    eventLog:       saved?.eventLog      ?? [],
+    exploredTiles:  saved?.exploredTiles ?? [],
     paused: false,
   };
 
-  // Recalculate storage caps based on placed buildings
-  ResourceSystem.recalcCaps(
-    G.resources,
-    BuildingSystem.getStorageCount(G.buildings)
-  );
-
+  ResourceSystem.recalcCaps(G.resources, BuildingSystem.getStorageCount(G.buildings));
   UISystem.setWorld(G.world, G);
-
-  // Defer first render until the game screen is visible and has real dimensions
-  requestAnimationFrame(() => {
-    UISystem.recalcLayout();
-    UISystem.render();
-  });
 }
 
-// Simple seeded PRNG (same algorithm as WorldGen, independent instance)
+function forceFirstRender() {
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    const vp = document.getElementById('map-viewport');
+    const cv = document.getElementById('game-canvas');
+    cv.width  = vp.clientWidth  || window.innerWidth;
+    cv.height = vp.clientHeight || Math.floor(window.innerHeight * 0.52);
+    UISystem.recalcLayout();
+    fullRender();
+    updateAchievementsPanel();
+  }));
+}
+
 function makePRNG(seed) {
   let s = seed >>> 0 || 0x6d2b79f5;
-  return function() {
+  return () => {
     s += 0x6d2b79f5;
     let z = s;
     z = Math.imul(z ^ (z >>> 15), z | 1);
@@ -183,189 +140,197 @@ function makePRNG(seed) {
 
 function endTurn() {
   if (!G || G.paused) return;
+  SoundSystem.play('endturn');
 
-  // ---- Advance time ----
+  // ---- Time ----
   G.day++;
-  if (G.day > G.year * 360 + 360) G.year++;  // ~360 days per year
-  G.season = Math.floor(((G.day - 1) % 120) / 30); // 4 seasons × 30 days
+  if (G.day > G.year * 360 + 360) G.year++;
+  G.season  = Math.floor(((G.day - 1) % 120) / 30);
+  G.prevEra = G.era;
 
   // ---- Resource regrowth ----
   ResourceSystem.processTurnRegrowth(G.world.tiles);
 
-  // ---- Building passive effects (farms produce food etc.) ----
+  // ---- Building passives ----
   BuildingSystem.processTurn(G.buildings, G.resources);
 
   // ---- Events ----
-  const disasterActive = !!(G.events.activeEvent);
+  const disasterWasActive = !!(G.events.activeEvent);
   const eventMsgs = EventSystem.processTurn(
-    G.events, G.world, G.tribe, G.resources, G.buildings,
-    G.day, G.season, rng
+    G.events, G.world, G.tribe, G.resources, G.buildings, G.day, G.season, rng
   );
+  const disasterFiredThisTurn = !!(G.events.activeEvent);
 
-  // ---- Tribe needs ----
+  if (disasterFiredThisTurn) {
+    SoundSystem.play('disaster');
+    spawnParticlesBurst(null, 'disaster');
+  }
+
+  // ---- Merchant ----
+  const merchantMsgs = MerchantSystem.processTurn(G.merchant, G.resources, G.era, rng);
+  if (merchantMsgs.some(m => m.banner)) {
+    SoundSystem.play('merchant');
+    updateMerchantBanner();
+  }
+
+  // ---- Tribe ----
   const buildingProxy = BuildingSystem.createProxy(G.buildings);
+  const moraleMultipliers = {
+    growth: MoraleSystem.growthMultiplier(G.morale),
+    decay:  MoraleSystem.decayMultiplier(G.morale),
+  };
   const tribeResult = TribeSystem.processTurn(
-    G.tribe, G.resources, buildingProxy, G.season, disasterActive
+    G.tribe, G.resources, buildingProxy, G.season, disasterFiredThisTurn, moraleMultipliers
   );
 
-  // ---- World passive (blizzard thaw etc.) ----
+  if (tribeResult.deaths > 0) SoundSystem.play('death');
+  if (tribeResult.grew   > 0) SoundSystem.play('growth');
+
+  // ---- Morale ----
+  MoraleSystem.processTurn(G.morale, tribeResult, disasterFiredThisTurn, G.era, G.prevEra);
+
+  // ---- World passive ----
   EventSystem.processWorldPassive(G.world);
 
-  // ---- Era progression ----
+  // ---- Era ----
   processEra();
 
-  // ---- Collect messages ----
-  const allMsgs = [...eventMsgs, ...tribeResult.messages];
-
-  // Log to gather panel
-  for (const msg of allMsgs) {
-    UISystem.logGather(msg.text);
+  // ---- Achievements ----
+  const newAchievements = AchievementSystem.checkAll(G);
+  for (const ach of newAchievements) {
+    SoundSystem.play('achievement');
+    showAchievementToast(ach);
   }
+
+  // ---- Log all messages ----
+  const allMsgs = [...eventMsgs, ...merchantMsgs, ...tribeResult.messages];
+  for (const msg of allMsgs) UISystem.logGather(msg);
 
   // ---- Auto-save every 5 turns ----
-  if (G.day % 5 === 0) {
-    autoSave();
-  }
+  if (G.day % 5 === 0) autoSave();
 
   // ---- Game over? ----
-  if (tribeResult.gameOver || G.tribe.population <= 0) {
-    gameOver();
-    return;
-  }
+  if (tribeResult.gameOver || G.tribe.population <= 0) { gameOver(); return; }
 
-  // ---- Re-render ----
+  // ---- Render ----
   fullRender();
+  updateMerchantBanner();
 }
 
-/**
- * Era progression: unlock new buildings / abilities.
- * Stone → Bronze at day 60; Bronze → Iron at day 150; etc.
- */
 function processEra() {
-  const ERA_THRESHOLDS = [0, 60, 150, 300];
-  for (let i = ERA_THRESHOLDS.length - 1; i >= 0; i--) {
-    if (G.day >= ERA_THRESHOLDS[i] && G.era < i) {
+  const thresholds = [0, 60, 150, 300];
+  const names      = ['Stone Age', 'Bronze Age', 'Iron Age', 'Classical Age'];
+  for (let i = thresholds.length - 1; i >= 0; i--) {
+    if (G.day >= thresholds[i] && G.era < i) {
       G.era = i;
-      const eraNames = ['Stone Age', 'Bronze Age', 'Iron Age', 'Classical Age'];
-      UISystem.logGather(`🏛️ Era reached: ${eraNames[i]}`);
-      UISystem.toast(`🏛️ New era: ${eraNames[i]}!`, 3000);
+      UISystem.logGather({ text: `🏛️ Era reached: ${names[i]}`, type: 'good' });
+      UISystem.toast(`🏛️ New era: ${names[i]}!`, 3000);
+      SoundSystem.play('era');
     }
   }
 }
 
 // =============================================
-// TILE TAP HANDLER
+// TILE TAP
 // =============================================
 
 function onTileTap(tile) {
   if (!G) return;
   const def = WorldGen.TILE_DEFS[tile.type];
-
-  if (currentMode === 'gather') {
-    handleGather(tile, def);
-  } else if (currentMode === 'build') {
-    handleBuild(tile, def);
-  }
-
-  // Always update info panel with tapped tile info
-  UISystem.setMode(currentMode === 'info' ? 'info' : currentMode);
+  if (currentMode === 'gather') handleGather(tile, def);
+  else if (currentMode === 'build') handleBuild(tile, def);
   UISystem.updateInfoPanel(G.tribe, G.resources, G.buildings);
 }
 
 function handleGather(tile, def) {
-  if (!def.passable) {
-    UISystem.toast('Cannot gather here.');
-    return;
-  }
+  if (!def.passable)    { UISystem.toast('Cannot gather here.'); return; }
   if (tile.buildingId) {
-    const b = G.buildings.placed[tile.buildingId];
+    const b    = G.buildings.placed[tile.buildingId];
     const bDef = BuildingSystem.BUILDING_DEFS[b?.defId];
-    UISystem.toast(`${bDef?.emoji || '🏗️'} ${bDef?.name || 'Building'} — ${bDef?.description || ''}`);
+    UISystem.toast(`${bDef?.emoji || '🏗️'} ${bDef?.name} — ${bDef?.description}`);
     return;
   }
-  if (tile.depleted) {
-    UISystem.toast('Tile depleted — needs time to recover.');
-    return;
-  }
+  if (tile.depleted) { UISystem.toast('Tile depleted — recovering.'); return; }
 
   const gained = ResourceSystem.gatherTile(tile, G.resources, G.season);
-  if (!gained) {
-    UISystem.toast(`${def.name} — nothing to gather.`);
-    return;
-  }
+  if (!gained)   { UISystem.toast(def.name + ' — nothing to gather.'); return; }
 
+  SoundSystem.play('gather');
   const parts = [];
-  if (gained.food  > 0) parts.push(`+${gained.food} 🌿`);
-  if (gained.wood  > 0) parts.push(`+${gained.wood} 🌲`);
-  if (gained.stone > 0) parts.push(`+${gained.stone} 🪨`);
-
-  UISystem.logGather(`${def.emoji || def.name}: ${parts.join(' ')}`);
+  if (gained.food  > 0) parts.push('+' + gained.food  + ' 🌿');
+  if (gained.wood  > 0) parts.push('+' + gained.wood  + ' 🌲');
+  if (gained.stone > 0) parts.push('+' + gained.stone + ' 🪨');
+  UISystem.logGather({ text: (def.emoji||def.name) + ': ' + parts.join(' '), type:'good' });
   updateHUDAndRender();
 }
 
 function handleBuild(tile, def) {
-  if (!selectedBuildDef) {
-    UISystem.toast('Select a building from the BUILD panel first.');
-    return;
-  }
+  if (!selectedBuildDef) { UISystem.toast('Select a building first.'); return; }
 
-  const result = BuildingSystem.place(
-    G.buildings, tile, selectedBuildDef, G.resources, G.era
-  );
+  const result = BuildingSystem.place(G.buildings, tile, selectedBuildDef, G.resources, G.era);
+  if (!result.ok) { UISystem.toast('❌ ' + result.reason); return; }
 
-  if (!result.ok) {
-    UISystem.toast('❌ ' + result.reason);
-    return;
-  }
-
-  // Recalculate storage if needed
-  ResourceSystem.recalcCaps(
-    G.resources,
-    BuildingSystem.getStorageCount(G.buildings)
-  );
-
+  ResourceSystem.recalcCaps(G.resources, BuildingSystem.getStorageCount(G.buildings));
   G.buildingsPlacedTotal++;
   const bDef = BuildingSystem.BUILDING_DEFS[selectedBuildDef];
-  UISystem.logGather(`Built ${bDef.emoji} ${bDef.name} at (${tile.x},${tile.y})`);
-  UISystem.toast(`${bDef.emoji} ${bDef.name} built!`);
+  UISystem.logGather({ text: 'Built ' + bDef.emoji + ' ' + bDef.name, type: 'good' });
+  UISystem.toast(bDef.emoji + ' ' + bDef.name + ' built!');
+  UISystem.revealAround(tile.x, tile.y, 2);
+  SoundSystem.play('build');
+  spawnParticlesBurst(tile, 'build');
 
-  selectedBuildDef = null; // deselect after placing
+  selectedBuildDef = null;
   updateHUDAndRender();
 }
 
 // =============================================
-// CONTROLS BINDING
+// CONTROLS
 // =============================================
 
 function bindGameControls() {
-  // End Turn
   document.getElementById('btn-end-turn').addEventListener('click', endTurn);
 
-  // Pause Menu
   document.getElementById('btn-menu').addEventListener('click', () => {
     if (!G) return;
     G.paused = !G.paused;
     document.getElementById('pause-menu').classList.toggle('hidden', !G.paused);
   });
-
   document.getElementById('btn-resume').addEventListener('click', () => {
     G.paused = false;
     document.getElementById('pause-menu').classList.add('hidden');
   });
-
   document.getElementById('btn-save-manual').addEventListener('click', () => {
-    autoSave();
-    UISystem.toast('💾 Game saved!');
+    autoSave(); UISystem.toast('💾 Game saved!');
   });
-
   document.getElementById('btn-abandon').addEventListener('click', () => {
-    if (confirm('Abandon this run? Progress will be lost.')) {
-      SaveSystem.deleteSave();
-      G = null;
+    if (confirm('Abandon this run?')) {
+      SaveSystem.deleteSave(); G = null;
       UISystem.showScreen('menu');
       document.getElementById('pause-menu').classList.add('hidden');
       document.getElementById('btn-continue').disabled = true;
     }
+  });
+
+  // Festival
+  document.getElementById('btn-festival').addEventListener('click', () => {
+    if (!G) return;
+    const result = MoraleSystem.holdFestival(G.morale, G.resources);
+    if (result.ok) {
+      SoundSystem.play('festival');
+      UISystem.toast('🎉 Festival! Morale boosted!');
+      UISystem.logGather({ text: '🎉 The tribe celebrates!', type: 'good' });
+      G.achievements._merchantTraded = true; // reuse flag for festival
+      updateHUDAndRender();
+    } else {
+      UISystem.toast('❌ ' + result.reason);
+    }
+  });
+
+  // Sound toggle
+  document.getElementById('btn-sound').addEventListener('click', () => {
+    const nowEnabled = !SoundSystem.isEnabled();
+    SoundSystem.setEnabled(nowEnabled);
+    document.getElementById('btn-sound').textContent = nowEnabled ? '🔊' : '🔇';
   });
 
   // Mode tabs
@@ -373,78 +338,303 @@ function bindGameControls() {
     tab.addEventListener('click', () => {
       currentMode = tab.dataset.mode;
       UISystem.setMode(currentMode);
+      if (currentMode === 'build' && G) refreshBuildPanel();
+      if (currentMode === 'info' && G) UISystem.updateInfoPanel(G.tribe, G.resources, G.buildings);
+      if (currentMode === 'trade' && G) updateTradePanel();
+      if (currentMode === 'achievements' && G) updateAchievementsPanel();
+    });
+  });
 
-      if (currentMode === 'build' && G) {
-        UISystem.updateBuildPanel(G.era, G.resources, selectedBuildDef, (defId) => {
-          selectedBuildDef = defId;
-          UISystem.updateBuildPanel(G.era, G.resources, selectedBuildDef, () => {});
-        });
-      }
-      if (currentMode === 'info' && G) {
-        UISystem.updateInfoPanel(G.tribe, G.resources, G.buildings);
+  // Leaderboard submit on game over screen
+  document.getElementById('btn-submit-score').addEventListener('click', submitLeaderboardScore);
+}
+
+// =============================================
+// TRADE PANEL
+// =============================================
+
+function updateTradePanel() {
+  const el = document.getElementById('trade-content');
+  if (!el || !G) return;
+
+  if (!G.merchant.active) {
+    el.innerHTML = '<p class="trade-empty">No merchant present. One will arrive eventually...</p>';
+    return;
+  }
+
+  if (G.merchant.trades.length === 0) {
+    el.innerHTML = '<p class="trade-empty">The merchant has nothing left to trade. They leave in ' + G.merchant.turnsLeft + ' turns.</p>';
+    return;
+  }
+
+  el.innerHTML = '<p class="panel-hint" style="margin-bottom:8px">🐪 Merchant here for ' + G.merchant.turnsLeft + ' more turns</p>';
+
+  for (const trade of G.merchant.trades) {
+    const label = MerchantSystem.getTradeLabel(trade);
+    const canDo = ResourceSystem.canAfford(G.resources, { [trade.give]: trade.giveAmt });
+    const div = document.createElement('div');
+    div.className = 'trade-card';
+    div.innerHTML = `
+      <span class="trade-label">${label}</span>
+      <button class="btn btn-primary" ${canDo ? '' : 'disabled'}>TRADE</button>`;
+    div.querySelector('button').addEventListener('click', () => {
+      const res = MerchantSystem.executeTrade(G.merchant, trade.id, G.resources, G.morale);
+      if (res.ok) {
+        G.achievements._merchantTraded = true;
+        SoundSystem.play('merchant');
+        UISystem.toast('🐪 Trade complete!');
+        updateTradePanel();
+        updateHUDAndRender();
+      } else {
+        UISystem.toast('❌ ' + res.reason);
       }
     });
+    el.appendChild(div);
+  }
+}
+
+function updateMerchantBanner() {
+  const banner = document.getElementById('merchant-banner');
+  if (!banner || !G) return;
+  if (G.merchant.active) {
+    banner.classList.remove('hidden');
+    document.getElementById('merchant-text').textContent =
+      '🐪 Merchant is here! (' + G.merchant.turnsLeft + ' turns left) — Check TRADE tab.';
+  } else {
+    banner.classList.add('hidden');
+  }
+}
+
+// =============================================
+// ACHIEVEMENTS PANEL
+// =============================================
+
+function updateAchievementsPanel() {
+  const el = document.getElementById('achievements-content');
+  if (!el || !G) return;
+  const all = AchievementSystem.getAll(G.achievements.unlocked);
+  el.innerHTML = '';
+  // Unlocked first, then locked
+  const sorted = [...all.filter(a=>a.unlocked), ...all.filter(a=>!a.unlocked)];
+  for (const ach of sorted) {
+    const div = document.createElement('div');
+    div.className = 'achievement-item' + (ach.unlocked ? ' unlocked' : '');
+    div.innerHTML = `
+      <span class="ach-icon">${ach.emoji}</span>
+      <div class="ach-info">
+        <div class="ach-name">${ach.name}</div>
+        <div class="ach-desc">${ach.desc}</div>
+      </div>`;
+    el.appendChild(div);
+  }
+}
+
+function showAchievementToast(ach) {
+  const el = document.createElement('div');
+  el.className = 'toast-achievement';
+  el.innerHTML = `${ach.emoji} Achievement Unlocked!<br><span style="font-size:12px;font-weight:400">${ach.name}</span>`;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 3000);
+}
+
+// =============================================
+// PARTICLES
+// =============================================
+
+function resizeParticleCanvas() {
+  const pc = document.getElementById('particle-canvas');
+  const vp = document.getElementById('map-viewport');
+  if (!pc || !vp) return;
+  pc.width  = vp.clientWidth  || window.innerWidth;
+  pc.height = vp.clientHeight || 300;
+}
+
+function spawnParticlesBurst(tile, type) {
+  const pc = document.getElementById('particle-canvas');
+  if (!pc || !G) return;
+
+  let cx = pc.width  / 2;
+  let cy = pc.height / 2;
+
+  // If a tile was given, try to get its screen position
+  if (tile) {
+    // We don't have direct access to UISystem internals, use centre as fallback
+    // (A future improvement: expose UISystem.tileToScreen(tile))
+  }
+
+  const count  = type === 'disaster' ? 30 : 18;
+  const colors = type === 'disaster'
+    ? ['#e74c3c', '#e67e22', '#f39c12', '#c0392b']
+    : ['#f39c12', '#2ecc71', '#3498db', '#ecf0f1'];
+
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 1.5 + Math.random() * 3.5;
+    particles.push({
+      x: cx, y: cy,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed - (type === 'disaster' ? 0 : 2),
+      life: 1,
+      decay: 0.025 + Math.random() * 0.03,
+      radius: 2 + Math.random() * 4,
+      color: colors[Math.floor(Math.random() * colors.length)],
+    });
+  }
+
+  if (particles.length > 0 && !particleRAF) tickParticles();
+}
+
+let particleRAF = null;
+
+function tickParticles() {
+  const pc  = document.getElementById('particle-canvas');
+  if (!pc) { particleRAF = null; return; }
+  const pctx = pc.getContext('2d');
+
+  pctx.clearRect(0, 0, pc.width, pc.height);
+
+  particles = particles.filter(p => p.life > 0);
+  for (const p of particles) {
+    p.x    += p.vx;
+    p.y    += p.vy;
+    p.vy   += 0.12; // gravity
+    p.life -= p.decay;
+    pctx.globalAlpha = Math.max(0, p.life);
+    pctx.fillStyle   = p.color;
+    pctx.beginPath();
+    pctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
+    pctx.fill();
+  }
+  pctx.globalAlpha = 1;
+
+  if (particles.length > 0) {
+    particleRAF = requestAnimationFrame(tickParticles);
+  } else {
+    particleRAF = null;
+    pctx.clearRect(0, 0, pc.width, pc.height);
+  }
+}
+
+// =============================================
+// LEADERBOARD
+// =============================================
+
+function submitLeaderboardScore() {
+  const nameInput = document.getElementById('leaderboard-name-input');
+  const name = (nameInput?.value || '').trim() || 'Survivor';
+  const statusEl = document.getElementById('leaderboard-status');
+  if (statusEl) statusEl.textContent = 'Submitting...';
+
+  const stats = window._lastGameOverStats;
+  if (!stats) return;
+
+  LeaderboardSystem.submitScore(
+    { name, days: stats.day, seed: stats.seed, era: stats.era },
+    ({ ok, rank, error }) => {
+      if (ok) {
+        if (statusEl) statusEl.textContent = `You ranked #${rank}! 🏆`;
+        loadAndShowLeaderboard(rank);
+      } else {
+        if (statusEl) statusEl.textContent = 'Could not connect to leaderboard.';
+      }
+    }
+  );
+}
+
+function loadAndShowLeaderboard(highlightRank) {
+  LeaderboardSystem.fetchScores().then(scores => {
+    const listEl = document.getElementById('leaderboard-list');
+    if (!listEl) return;
+    listEl.innerHTML = '';
+
+    const ERA_NAMES = ['Stone', 'Bronze', 'Iron', 'Classical'];
+
+    scores.forEach((s, i) => {
+      const row = document.createElement('div');
+      row.className = 'lb-row' + (highlightRank === i + 1 ? ' highlight' : '');
+      row.innerHTML = `
+        <span class="lb-rank">#${i+1}</span>
+        <span class="lb-name">${s.name}</span>
+        <span class="lb-days">${s.days}d</span>
+        <span style="font-size:10px;color:var(--text-dim);margin-left:4px">${ERA_NAMES[s.era]||''}</span>`;
+      listEl.appendChild(row);
+    });
+
+    if (scores.length === 0) {
+      listEl.innerHTML = '<p style="font-size:12px;color:var(--text-dim)">No scores yet. Be the first!</p>';
+    }
   });
 }
 
 // =============================================
-// RENDERING HELPERS
+// RENDERING
 // =============================================
 
 function fullRender() {
   if (!G) return;
-  // Re-check layout in case canvas was zero-sized on first paint
   const vp = document.getElementById('map-viewport');
   if (vp && vp.clientHeight > 0 && document.getElementById('game-canvas').height === 0) {
     UISystem.recalcLayout();
   }
   UISystem.render();
-  UISystem.updateHUD(G.tribe, G.resources, G.day, G.year, G.season, G.era);
+  UISystem.updateHUD(G.tribe, G.resources, G.day, G.year, G.season, G.era, G.morale);
   UISystem.updateInfoPanel(G.tribe, G.resources, G.buildings);
   UISystem.updateEventBanner(EventSystem.getPendingWarning(G.events));
-
-  if (currentMode === 'build') {
-    UISystem.updateBuildPanel(G.era, G.resources, selectedBuildDef, (defId) => {
-      selectedBuildDef = defId;
-      UISystem.updateBuildPanel(G.era, G.resources, selectedBuildDef, () => {});
-    });
-  }
+  updateMoraleHUD();
+  if (currentMode === 'build')         refreshBuildPanel();
+  if (currentMode === 'trade')         updateTradePanel();
+  if (currentMode === 'achievements')  updateAchievementsPanel();
 }
 
 function updateHUDAndRender() {
   if (!G) return;
   UISystem.render();
-  UISystem.updateHUD(G.tribe, G.resources, G.day, G.year, G.season, G.era);
-  if (currentMode === 'build') {
-    UISystem.updateBuildPanel(G.era, G.resources, selectedBuildDef, (defId) => {
-      selectedBuildDef = defId;
-    });
-  }
+  UISystem.updateHUD(G.tribe, G.resources, G.day, G.year, G.season, G.era, G.morale);
+  updateMoraleHUD();
+  if (currentMode === 'build') refreshBuildPanel();
+  if (currentMode === 'trade') updateTradePanel();
+}
+
+function updateMoraleHUD() {
+  if (!G) return;
+  const fill = document.getElementById('morale-bar-fill');
+  if (!fill) return;
+  const m = G.morale.morale;
+  const color = m >= 60 ? '#2ecc71' : m >= 30 ? '#f39c12' : '#c0392b';
+  fill.style.width      = m + '%';
+  fill.style.background = color;
+  fill.title = MoraleSystem.getLabel(m);
+}
+
+function refreshBuildPanel() {
+  UISystem.updateBuildPanel(G.era, G.resources, selectedBuildDef, defId => {
+    selectedBuildDef = defId;
+    UISystem.updateBuildPanel(G.era, G.resources, selectedBuildDef, () => {});
+  });
 }
 
 // =============================================
-// SAVE / LOAD
+// SAVE
 // =============================================
 
 function autoSave() {
   if (!G) return;
   const ok = SaveSystem.save({
-    seed:       G.seed,
-    day:        G.day,
-    year:       G.year,
-    season:     G.season,
-    era:        G.era,
-    tribe:      G.tribe,
-    resources:  G.resources,
-    worldTiles: G.world.tiles,
-    buildings:  G.buildings,
-    eventLog:   G.eventLog,
+    seed: G.seed, day: G.day, year: G.year, season: G.season, era: G.era,
+    tribe:          G.tribe,
+    resources:      G.resources,
+    worldTiles:     G.world.tiles,
+    buildings:      G.buildings,
+    eventLog:       G.eventLog,
+    exploredTiles:  G.exploredTiles || [],
+    growthAccumulator: TribeSystem.getAccumulator(),
+    morale:         G.morale,
+    merchant:       G.merchant,
+    achievements:   G.achievements,
+    buildingsPlacedTotal: G.buildingsPlacedTotal,
   });
-  const indicator = document.getElementById('btn-autosave-indicator');
-  if (indicator) {
-    indicator.textContent = ok ? '💾' : '❌';
-    setTimeout(() => { if (indicator) indicator.textContent = '💾'; }, 1500);
-  }
+  const ind = document.getElementById('btn-autosave-indicator');
+  if (ind) { ind.textContent = ok ? '💾' : '❌'; setTimeout(()=>{ if(ind) ind.textContent='💾'; }, 1500); }
   if (ok) document.getElementById('btn-continue').disabled = false;
 }
 
@@ -453,15 +643,21 @@ function autoSave() {
 // =============================================
 
 function gameOver() {
-  UISystem.showGameOver({
-    day:    G.day,
-    year:   G.year,
-    season: G.season,
-    era:    G.era,
+  const stats = {
+    day:    G.day,   year:   G.year,
+    season: G.season, era:   G.era,
     seed:   G.seed,
+    tilesExplored:   UISystem.getExploredCount(),
     buildingsPlaced: G.buildingsPlacedTotal,
-  });
+  };
+  window._lastGameOverStats = stats;
+
+  UISystem.showGameOver(stats);
   SaveSystem.deleteSave();
   document.getElementById('btn-continue').disabled = true;
+
+  // Load leaderboard scores for display (submit is user-triggered)
+  loadAndShowLeaderboard(null);
+
   G = null;
 }
