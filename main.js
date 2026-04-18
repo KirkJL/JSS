@@ -157,6 +157,12 @@ function initGameState(world, saved) {
   );
 
   UISystem.setWorld(G.world, G);
+
+  // Defer first render until the game screen is visible and has real dimensions
+  requestAnimationFrame(() => {
+    UISystem.recalcLayout();
+    UISystem.render();
+  });
 }
 
 // Simple seeded PRNG (same algorithm as WorldGen, independent instance)
@@ -387,6 +393,11 @@ function bindGameControls() {
 
 function fullRender() {
   if (!G) return;
+  // Re-check layout in case canvas was zero-sized on first paint
+  const vp = document.getElementById('map-viewport');
+  if (vp && vp.clientHeight > 0 && document.getElementById('game-canvas').height === 0) {
+    UISystem.recalcLayout();
+  }
   UISystem.render();
   UISystem.updateHUD(G.tribe, G.resources, G.day, G.year, G.season, G.era);
   UISystem.updateInfoPanel(G.tribe, G.resources, G.buildings);
