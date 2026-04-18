@@ -127,7 +127,9 @@
     <div id="hud-season">
       <span id="season-label">🌱 Spring · Year 1</span>
       <span id="era-label">Stone Age</span>
+      <span id="seed-label">Seed -</span>
     </div>
+    <div id="hud-objective"><span id="objective-label">Reach Day 50 and keep the tribe alive.</span></div>
 
     <!-- EVENT NOTIFICATION -->
     <div id="event-banner" class="hidden">
@@ -161,7 +163,8 @@
 
       <!-- Gather Mode Panel -->
       <div id="panel-gather" class="mode-panel active">
-        <p class="panel-hint">Tap a tile to gather its resources.</p>
+        <p class="panel-hint">Select a villager, then tap a tile to assign gathering.</p>
+        <div id="villager-list" class="villager-list"></div>
         <div id="gather-log"></div>
       </div>
 
@@ -213,7 +216,7 @@
   <script src="game/morale.js"></script>
   <script src="game/merchant.js"></script>
   <script src="game/achievements.js"></script>
-  <script src="game/leaderboard.js"></script>
+  <script src="game/leaderboards.js"></script>
   <script src="game/world.js"></script>
   <script src="game/tribe.js"></script>
   <script src="game/resources.js"></script>
