@@ -22,8 +22,9 @@ const SaveSystem = (() => {
     era: 'number',
     tribe: 'object',
     resources: 'object',
-    worldTiles: 'object',  // stored as flat array
+    worldTiles: 'object',
     buildings: 'object',
+    // exploredTiles and growthAccumulator are optional (added later)
   };
 
   const CURRENT_VERSION = 1;
@@ -64,7 +65,13 @@ const SaveSystem = (() => {
         buildingId: t.buildingId || null,
       })),
       buildings: state.buildings,
-      eventLog: (state.eventLog || []).slice(-30), // keep last 30
+      eventLog:          (state.eventLog || []).slice(-30),
+      exploredTiles:        state.exploredTiles || [],
+      growthAccumulator:    state.growthAccumulator || 0,
+      morale:               state.morale   || {},
+      merchant:             state.merchant || {},
+      achievements:         state.achievements || {},
+      buildingsPlacedTotal: state.buildingsPlacedTotal || 0,
     };
   }
 
